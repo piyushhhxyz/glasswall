@@ -1,0 +1,23 @@
+[project]
+name = "pii-redactor"
+version = "1.0.0"
+description = "Structure-preserving PII redaction for DOCX, built for RL-environment data sanitisation"
+requires-python = ">=3.11"
+dependencies = ["python-docx>=1.1.2", "lxml>=5.0"]
+
+[project.optional-dependencies]
+ner = ["spacy>=3.7"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+redact = "pii_redactor.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pii_redactor"]
