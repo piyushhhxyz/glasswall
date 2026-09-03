@@ -17,7 +17,19 @@ NOISY_TYPES = {
     PiiType.AADHAAR,
     PiiType.DIN,
     PiiType.REG_NUMBER,
+    PiiType.URL,
 }
+
+# Hosts that serve only static assets -- icons, fonts, logos. A URL pointing at
+# one carries no personal data, and in this export they outnumber every real
+# finding. A document or meeting link is *not* here: those identify things.
+ASSET_HOSTS = {
+    "fonts.gstatic.com", "fonts.googleapis.com", "ssl.gstatic.com", "www.gstatic.com",
+    "gstatic.com", "slack-edge.com", "a.slack-edge.com", "emoji.slack-edge.com",
+    "secure.gravatar.com", "gravatar.com", "cdn.jsdelivr.net", "unpkg.com",
+    "cdnjs.cloudflare.com", "w3.org", "www.w3.org", "schemas.openxmlformats.org",
+}
+_ASSET_PATH = re.compile(r"/(?:images?|icons?|assets?|static|fonts?|logos?|emoji)/", re.I)
 
 # JSON/JSONL fields whose values are identifiers or clocks, never personal data.
 STRUCTURAL_KEYS = {
@@ -64,6 +76,17 @@ def _epoch_like(value: str) -> bool:
     return bool(re.match(r"^1\d{12}$|^1\d{9}$", digits)) and len(digits) == len(compact)
 
 
+def _asset_reason(url: str) -> str | None:
+    """Why this URL is decoration rather than data, or None if it may matter."""
+    host = re.sub(r"^[a-z]+://", "", url.strip().lower()).split("/")[0].split("?")[0]
+    host = re.sub(r"^www\.", "", host.split("@")[-1])
+    if any(host == known or host.endswith("." + known) for known in ASSET_HOSTS):
+        return "static asset host"
+    if _ASSET_PATH.search(url) and re.search(r"\.(?:png|jpe?g|gif|svg|webp|ico|css|js|woff2?)$", url, re.I):
+        return "static asset path"
+    return None
+
+
 def owning_key(text: str, start: int) -> str | None:
     """The JSON key whose value contains offset `start`, if it is right there."""
     match = _KEY_PATTERN.search(text[max(0, start - _KEY_WINDOW):start])
@@ -76,6 +99,9 @@ def classify(pii_type: PiiType, value: str, text: str = "", start: int = -1) -> 
         return None
 
     inner = value.strip(_JSON_PUNCTUATION)
+
+    if pii_type is PiiType.URL:
+        return _asset_reason(inner)
 
     # An address of only digits is a timestamp the pincode anchor grew out of.
     # Checked on the stripped span, because an over-captured real address also

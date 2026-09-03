@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pii_redactor.policy import Policy
 
+from . import audit as audit_module
 from . import diff as diff_module
 from . import extract as extract_module
 from . import scan as scan_module
@@ -163,6 +164,25 @@ def compare(
     response["verdict"] = report.verdict
     response["diff"] = diff_module.align(before.text, after.text, collapse=collapse)
     return JSONResponse(response)
+
+
+@app.get("/api/audit")
+def audit(
+    prefix: str = "",
+    prefix_redacted: str | None = None,
+    types: str | None = None,
+    max_files: int = Query(audit_module.DEFAULT_MAX_FILES, ge=1, le=2000),
+    max_depth: int = Query(audit_module.DEFAULT_MAX_DEPTH, ge=1, le=12),
+) -> dict:
+    """Verify every paired file under a prefix, worst first.
+
+    Bounded, and says when it stopped: a silent cap reads as "nothing to find".
+    """
+    result = audit_module.run(
+        browser, prefix, prefix_redacted, _policy(types),
+        max_files=max_files, max_depth=max_depth,
+    )
+    return result.to_json()
 
 
 @app.get("/api/raw")

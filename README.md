@@ -87,11 +87,23 @@ wrote is visible without hunting for it. Pick a file and you get:
 - **Side by side** — the original and the redacted text, line-aligned. PII found
   in the original is highlighted on the left; anything that *survived* is
   highlighted red on the right.
-- **Leaks** — values detected in the original that still occur in the redacted
-  file, ranked by severity. This is the only tab that represents a failure.
+- **Leaks** — values detected in the original that still occur verbatim in the
+  redacted file, ranked by severity, each with the line, column and structural
+  path where it survived. Clicking a location jumps to it in the diff.
+- **Partial** — values whose exact string changed but which left an identifying
+  fragment behind.
 - **Structural** — matches set aside as machine noise, each with the reason.
 - **All findings** — every detection on both sides, plus the surrogates the
   redactor introduced.
+
+`audit folder ▸` verifies every paired file beneath the current folder and lists
+the ones worth opening, worst first — rather than clicking through files until a
+leak turns up. Same thing from the terminal:
+
+```bash
+pii-verify audit slack/          # exits non-zero if anything survived
+pii-verify audit slack/ --json --max-files 500
+```
 
 Objects are fetched capped (5 MiB by default, `MAX_OBJECT_BYTES`) with a ranged
 GET, and listings are lazy — the reference export holds ~773k objects, so nothing
@@ -143,6 +155,7 @@ lands in one of three buckets:
 | | meaning |
 |---|---|
 | **leak** | detected in the original, still present in the output — a failure |
+| **partial** | changed, but an identifying fragment of it survived |
 | **redacted** | detected in the original, gone from the output — the goal |
 | **surrogate** | in the output only, never in the original — expected |
 
@@ -150,10 +163,41 @@ Comparison ignores whitespace entirely, because respacing is unpredictable in
 both directions: `foo@bar. com` may be normalised to `foo@bar.com`, and a rewrap
 can just as easily split a value that was intact.
 
-Detections are shared with the redactor (`pii_redactor.detectors`), so the two
-agree by construction. The gazetteer and spaCy passes are excluded: both build
-their vocabulary from the document in front of them, which is unstable across a
-before/after pair.
+A **partial** is what exact matching misses. `rajesh.nair@acme.in` becoming
+`rajesh.nair@surrogate.net` is a changed string, so exact matching calls it
+redacted — but the mailbox name still names a person. The same applies to a
+private email domain, a surviving surname, a pincode left in an otherwise
+rewritten address, or the last eight digits of an identifier. Partials are
+reported separately and one severity notch below a full leak.
+
+To stay precise, fragments are only looked for where they mean something: names
+are split into words, but URLs and secrets are not (splitting a webhook yields
+`https`, `hooks`, `slack` — none of which is the secret), addresses are checked
+by pincode rather than by word, role mailboxes (`support@`) and shared hosts
+(`gmail.com`, `slack.com`) are ignored, and machine handles like `T00000000` are
+not mistaken for surnames. See `pii_verifier/partial.py`.
+
+### What gets detected
+
+Detection is shared with the redactor (`pii_redactor.detectors`), so the two
+agree by construction, plus two additions the redactor does not have:
+
+- **Credentials** (`secrets.py`) — AWS keys, GitHub and Slack tokens, Google API
+  keys, Stripe keys, JWTs, private keys, Slack and Discord webhooks, bearer and
+  basic auth, credentials in a URL, and labelled `api_key = …` values. The
+  reference export contained a live Slack webhook that was previously reported
+  only as a low-severity URL; these are `critical`. Placeholders (`xxxx`,
+  `<your-key>`, `${API_KEY}`) are filtered out.
+- **Labelled fields** (`fields.py`) — nothing in `Rajesh Kumar Nair` matches a
+  pattern, so a person's name is invisible to a regex. But an export labels its
+  own data: `"real_name": "…"` is a person because of the key. A narrow field
+  list maps `real_name`, `display_name`, `email`, `phone`, `address`, `company`
+  and friends to their types. A bare `name` is excluded — in this export it is a
+  channel or a file at least as often as a person.
+
+The redactor's own name gazetteer stays **off** by default: it is tuned for DOCX
+prose and on JSON returns whole sentences as organisations. Pass
+`gazetteer=True` to `scan` or `verify` if the input really is prose.
 
 ### Structural noise
 
@@ -164,6 +208,11 @@ matches are moved to `ignored` with a reason and left out of the redaction rate,
 never silently dropped (`suppress_noise=False` turns it off). The rules are
 conservative: only numeric-shaped types are ever set aside, and never an email,
 PAN, or labelled date of birth. See `pii_verifier/noise.py`.
+
+Static-asset URLs are set aside the same way. A `fonts.gstatic.com` logo or a
+`slack-edge.com` avatar carries no personal data, and in this export they
+outnumbered every real finding. A meeting code or a document id is not
+decoration and is still reported.
 
 ### Renamed paths
 

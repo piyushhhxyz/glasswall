@@ -70,12 +70,29 @@
   }
   .paths button:hover { border-color: var(--accent); color: var(--accent); }
 
-  .filter { padding: 8px 12px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+  .filter {
+    padding: 8px 12px; border-bottom: 1px solid var(--line); flex-shrink: 0;
+    display: flex; gap: 6px;
+  }
   .filter input {
-    width: 100%; padding: 6px 8px; background: var(--bg); border: 1px solid var(--line);
+    flex: 1; min-width: 0; padding: 6px 8px; background: var(--bg); border: 1px solid var(--line);
     border-radius: 6px; color: var(--text); font: 12px var(--mono);
   }
   .filter input:focus { outline: none; border-color: var(--accent); }
+  .filter button {
+    padding: 6px 9px; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; font: 11px var(--mono); cursor: pointer; white-space: nowrap;
+  }
+  .filter button:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* ---------- audit ---------- */
+  .auditrow {
+    display: flex; align-items: baseline; gap: 10px; padding: 7px 16px;
+    border-bottom: 1px solid var(--line); cursor: pointer; font: 12px var(--mono);
+  }
+  .auditrow:hover { background: var(--panel); }
+  .auditrow .k { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .auditrow .findings { color: var(--dim); font-size: 11px; padding: 2px 0 0 26px; }
 
   #tree { overflow-y: auto; flex: 1; padding: 4px 0; }
   .row {
@@ -108,6 +125,7 @@
   .badge.clean { background: #14301c; color: var(--clean); border: 1px solid #1d4429; }
   .badge.leak { background: #3d1418; color: var(--leak); border: 1px solid #5c2427; }
   .badge.no_pii, .badge.opaque, .badge.no_text { background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); }
+  .badge.partial { background: #3a2a08; color: var(--warn); border: 1px solid #6b4410; }
   .badge.unpaired { background: #4a2f0a; color: var(--warn); border: 1px solid #6b4410; }
   .path { font: 12px var(--mono); color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
   .stats { display: flex; gap: 16px; font-size: 12px; }
@@ -163,6 +181,13 @@
   .sev.medium { background: #4a3a0a; color: var(--warn); }
   .sev.low { background: var(--panel-2); color: var(--dim); }
   .ty { font: 11px var(--mono); color: var(--accent); }
+  td.loc { white-space: nowrap; font: 11px var(--mono); }
+  td.loc a { color: var(--accent); cursor: pointer; text-decoration: none; border-bottom: 1px dotted currentColor; }
+  td.loc a:hover { color: #fff; }
+  td.pathcell {
+    font: 11px var(--mono); color: var(--dim); max-width: 220px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 
   .chips { display: flex; flex-wrap: wrap; gap: 5px; padding: 10px 16px; }
   .chip { font: 11px var(--mono); padding: 3px 8px; border-radius: 4px; background: var(--panel-2); color: var(--dim); }
@@ -212,7 +237,10 @@
       <label>red <input id="pathR" spellcheck="false" placeholder="(root)"></label>
       <button id="pathGo" title="browse these two paths as a pair">pair</button>
     </div>
-    <div class="filter"><input id="filter" placeholder="filter this folder…" autocomplete="off"></div>
+    <div class="filter">
+      <input id="filter" placeholder="filter this folder…" autocomplete="off">
+      <button id="auditGo" title="verify every paired file under this folder">audit folder ▸</button>
+    </div>
     <div id="tree"><div class="spin">loading…</div></div>
   </aside>
 
@@ -228,6 +256,7 @@
       <div class="tabs" id="tabs"></div>
       <div class="pane" id="pane-diff"></div>
       <div class="pane" id="pane-leaks"></div>
+      <div class="pane" id="pane-partials"></div>
       <div class="pane" id="pane-ignored"></div>
       <div class="pane" id="pane-all"></div>
     </div>
@@ -236,7 +265,7 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-const PANES = ["diff", "leaks", "ignored", "all"];
+const PANES = ["diff", "leaks", "partials", "ignored", "all"];
 let state = { prefix: "", entries: [], selected: null, data: null, tab: "diff" };
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -409,7 +438,8 @@ async function openFile(relative, relativeRedacted) {
 function render() {
   const d = state.data;
   const r = d.report;
-  const label = { clean: "no leaks", leak: "leak found", no_pii: "no pii detected",
+  const label = { clean: "no leaks", leak: "leak found", partial: "partial leak",
+                  no_pii: "no pii detected",
                   unpaired: "unpaired", opaque: "binary — bytes only",
                   no_text: "no text extracted" }[d.verdict] || d.verdict;
 
@@ -419,6 +449,7 @@ function render() {
     stats = `<div class="stats">
       <div class="stat"><b>${s.distinct_before}</b><s>pii in original</s></div>
       <div class="stat"><b style="color:${s.leaked ? "var(--leak)" : "var(--clean)"}">${s.leaked}</b><s>leaked</s></div>
+      ${s.partial ? `<div class="stat"><b style="color:var(--warn)">${s.partial}</b><s>partial</s></div>` : ""}
       <div class="stat"><b>${s.removed}</b><s>removed</s></div>
       <div class="stat"><b>${s.surrogates}</b><s>surrogates</s></div>
       ${s.ignored ? `<div class="stat"><b style="color:var(--dim)">${s.ignored}</b><s>structural</s></div>` : ""}
@@ -433,6 +464,7 @@ function render() {
   if (d.diff) tabs.push(["diff", "Side by side", d.diff.changed_lines || null]);
   if (r) {
     tabs.push(["leaks", "Leaks", r.leaks.length || null]);
+    if (r.partials.length) tabs.push(["partials", "Partial", r.partials.length]);
     if (r.ignored.length) tabs.push(["ignored", "Structural", r.ignored.length]);
     tabs.push(["all", "All findings", r.stats.distinct_before || null]);
   } else if (d.scan) {
@@ -445,6 +477,7 @@ function render() {
 
   renderDiff();
   renderLeaks();
+  renderPartials();
   renderIgnored();
   renderAll();
   showTab(tabs.length && !tabs.some(t => t[0] === state.tab) ? tabs[0][0] : state.tab);
@@ -536,14 +569,43 @@ function renderDiff() {
     (d.diff.truncated ? `<div class="msg warn">Diff truncated at ${d.diff.rows.length} rows.</div>` : "");
 }
 
-function findingRows(rows) {
+/* A leak is only actionable with somewhere to look, so each row carries the
+   line, the structural path, and a jump into the diff. */
+function siteCells(sites) {
+  if (!sites || !sites.length) return `<td colspan="2" style="color:var(--faint)">—</td>`;
+  const first = sites[0];
+  const more = sites.length > 1 ? ` <span style="color:var(--faint)">+${sites.length - 1}</span>` : "";
+  const frag = first.fragment ? ` <em style="color:var(--warn)">${esc(first.fragment)}</em>` : "";
+  return `<td class="loc"><a data-line="${first.line}">line ${first.line}:${first.column}</a>${more}${frag}</td>
+    <td class="pathcell" title="${esc(first.path || "")}">${esc(first.path || "")}</td>`;
+}
+
+function findingRows(rows, withSites = true) {
   return rows.map(f => `<tr>
     <td><span class="sev ${f.severity}">${f.severity}</span></td>
     <td><span class="ty">${esc(f.type)}</span></td>
-    <td class="v">${esc(f.text.length > 200 ? f.text.slice(0, 200) + "…" : f.text)}</td>
+    <td class="v">${esc(f.text.length > 160 ? f.text.slice(0, 160) + "…" : f.text)}</td>
     <td>${f.occurrences ?? 1}</td>
+    ${withSites ? siteCells(f.in_redacted || f.sites) : ""}
     <td style="color:var(--faint);font:11px var(--mono)">${esc(f.detector)}</td></tr>`).join("");
 }
+
+/* Clicking a location scrolls the side-by-side view to that line. */
+function wireJumps(pane) {
+  $(pane).querySelectorAll("a[data-line]").forEach(a => a.onclick = () => {
+    showTab("diff");
+    const line = Number(a.dataset.line);
+    const gutters = [...$("pane-diff").querySelectorAll("tr td.gut:nth-child(3)")];
+    const target = gutters.find(td => Number(td.textContent) === line);
+    if (!target) return;
+    target.parentElement.scrollIntoView({ block: "center", behavior: "smooth" });
+    target.parentElement.style.outline = "2px solid var(--accent)";
+    setTimeout(() => (target.parentElement.style.outline = ""), 2200);
+  });
+}
+
+const FINDING_HEAD = `<thead><tr><th>severity</th><th>type</th><th>value</th><th>count</th>
+  <th>where</th><th>path</th><th>detector</th></tr></thead>`;
 
 function renderLeaks() {
   const r = state.data.report;
@@ -551,17 +613,31 @@ function renderLeaks() {
   const pane = $("pane-leaks");
   if (!r.leaks.length) {
     pane.innerHTML = `<div class="empty">
-      <div style="color:var(--clean);font-size:15px;font-weight:600">No original values survived.</div>
+      <div style="color:var(--clean);font-size:15px;font-weight:600">No original values survived intact.</div>
       <div style="margin-top:8px;font-size:12px">
         All ${r.stats.in_scope} distinct in-scope PII values found in the original are absent from the redacted file.
-        ${r.stats.ignored ? `<br>${r.stats.ignored} further match${r.stats.ignored > 1 ? "es were" : " was"} set aside as machine structure — see the Structural tab.` : ""}
+        ${r.stats.partial ? `<br><span style="color:var(--warn)">${r.stats.partial} survived in part — see the Partial tab.</span>` : ""}
+        ${r.stats.ignored ? `<br>${r.stats.ignored} further match${r.stats.ignored > 1 ? "es were" : " was"} set aside as machine structure.` : ""}
       </div></div>`;
     return;
   }
   pane.innerHTML = `<div class="msg">${r.leaks.length} value${r.leaks.length > 1 ? "s" : ""} detected in the original
-    still appear verbatim in the redacted file.</div>
-    <table class="list"><thead><tr><th>severity</th><th>type</th><th>value</th><th>count</th><th>detector</th></tr></thead>
-    <tbody>${findingRows(r.leaks)}</tbody></table>`;
+    still appear verbatim in the redacted file. Click a line to jump to it.</div>
+    <table class="list">${FINDING_HEAD}<tbody>${findingRows(r.leaks)}</tbody></table>`;
+  wireJumps("pane-leaks");
+}
+
+/* A value whose exact string changed but whose identifying part did not. Exact
+   matching calls these redacted, which is why they get their own tab. */
+function renderPartials() {
+  const r = state.data.report;
+  if (!r || !r.partials.length) return;
+  $("pane-partials").innerHTML = `<div class="msg warn">
+      ${r.partials.length} value${r.partials.length > 1 ? "s" : ""} changed but left an identifying
+      fragment behind — a mailbox name, a private domain, a surname, or a run of digits.
+    </div>
+    <table class="list">${FINDING_HEAD}<tbody>${findingRows(r.partials)}</tbody></table>`;
+  wireJumps("pane-partials");
 }
 
 function renderIgnored() {
@@ -606,6 +682,59 @@ function renderAll() {
     </div>
     <table class="list"><tbody>${findingRows(r.surrogates.slice(0, 300))}</tbody></table>`;
 }
+
+/* Auditing the whole folder, rather than opening files one at a time until a
+   leak turns up. Results replace the detail view and link back into it. */
+async function runAudit() {
+  const prefix = state.prefix;
+  $("placeholder").style.display = "none";
+  $("detail").style.display = "flex";
+  $("verdict").innerHTML = `<span class="badge no_pii">auditing</span>
+    <span class="path">${esc(prefix || "(root)")}</span>`;
+  $("tabs").innerHTML = "";
+  PANES.forEach(t => $("pane-" + t).innerHTML = "");
+  $("pane-diff").classList.add("on");
+  $("pane-diff").innerHTML = `<div class="spin">verifying every paired file under
+    ${esc(prefix || "the root")} — this fetches both sides of each file…</div>`;
+
+  try {
+    const a = await api("/api/audit", {
+      prefix,
+      prefix_redacted: state.prefixRedacted === prefix ? null : state.prefixRedacted,
+    });
+    const flagged = a.files.filter(f => f.verdict === "leak" || f.verdict === "partial");
+    const counts = Object.entries(a.by_verdict)
+      .map(([k, v]) => `<span class="chip">${esc(k)} <b>${v}</b></span>`).join("");
+
+    $("verdict").innerHTML = `<span class="badge ${flagged.length ? "leak" : "clean"}">
+        ${flagged.length ? `${flagged.length} file${flagged.length > 1 ? "s" : ""} flagged` : "all clean"}</span>
+      <span class="path">${esc(prefix || "(root)")}</span><div class="spacer"></div>
+      <div class="stats"><div class="stat"><b>${a.checked}</b><s>files checked</s></div></div>`;
+
+    const notes = (a.notes || []).map(n => `<div class="msg warn">${esc(n)}</div>`).join("");
+    const rows = a.files.map(f => {
+      const badge = { leak: "leak", partial: "partial", error: "unpaired",
+                      clean: "clean", no_pii: "no_pii", no_text: "no_text" }[f.verdict] || "no_pii";
+      const detail = (f.top || []).map(t =>
+        `<div class="findings">${esc(t.type)} · ${esc(String(t.text).slice(0, 90))}${
+          t.line ? ` · line ${t.line}` : ""}${t.path ? ` · ${esc(t.path)}` : ""}</div>`).join("");
+      return `<div><div class="auditrow" data-r="${esc(f.relative)}" data-rr="${esc(f.relative_redacted)}">
+          <span class="badge ${badge}" style="font-size:9px;padding:2px 6px">${esc(f.verdict)}</span>
+          <span class="k" title="${esc(f.relative)}">${esc(f.relative.slice(prefix.length) || f.relative)}</span>
+          ${f.error ? `<span style="color:var(--leak)">${esc(f.error)}</span>` : ""}
+          ${f.redaction_rate != null ? `<span style="color:var(--faint)">${f.redaction_rate}%</span>` : ""}
+        </div>${detail}</div>`;
+    }).join("");
+
+    $("pane-diff").innerHTML = notes + `<div class="chips">${counts}</div>` +
+      (rows || `<div class="empty">No paired files under this folder.</div>`);
+    $("pane-diff").querySelectorAll(".auditrow").forEach(row =>
+      row.onclick = () => openFile(row.dataset.r, row.dataset.rr));
+  } catch (e) {
+    $("pane-diff").innerHTML = `<div class="msg">${esc(e.message)}</div>`;
+  }
+}
+$("auditGo").onclick = runAudit;
 
 loadConfig();
 browse("");

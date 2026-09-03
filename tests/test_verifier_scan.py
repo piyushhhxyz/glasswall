@@ -106,10 +106,25 @@ def test_leaks_are_ordered_by_severity():
     assert report.stats["highest_severity"] == severities[0]
 
 
-def test_leak_carries_offsets_into_the_redacted_text():
-    report = verify("mail person.one@example.com", "PREFIX mail person.one@example.com")
-    start, end = report.leaks[0]["after_offsets"][0]
-    assert "PREFIX mail person.one@example.com"[start:end] == "person.one@example.com"
+def test_leak_is_located_in_the_redacted_text():
+    after = "PREFIX mail person.one@example.com"
+    site = verify("mail person.one@example.com", after).leaks[0]["in_redacted"][0]
+    assert after[site["start"]:site["end"]] == "person.one@example.com"
+    assert site["line"] == 1 and site["column"] == 13
+
+
+def test_leak_is_also_located_in_the_original():
+    before = "line one\nmail person.one@example.com"
+    site = verify(before, before).leaks[0]["in_original"][0]
+    assert site["line"] == 2
+    assert before[site["start"]:site["end"]] == "person.one@example.com"
+
+
+def test_leak_location_carries_a_snippet():
+    after = "PREFIX mail person.one@example.com SUFFIX"
+    snippet = verify("mail person.one@example.com", after).leaks[0]["in_redacted"][0]["snippet"]
+    assert snippet["match"] == "person.one@example.com"
+    assert "PREFIX" in snippet["before"] and "SUFFIX" in snippet["after"]
 
 
 # --------------------------------------------------------------------------- #

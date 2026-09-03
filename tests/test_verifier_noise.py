@@ -166,6 +166,44 @@ def test_non_numeric_types_bypass_the_rules_entirely():
         assert noise.classify(pii_type, '"1712128948.892889') is None
 
 
+# --------------------------------------------------------------------------- #
+# Asset URLs, which outnumbered every real finding in the export
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://fonts.gstatic.com/s/i/productlogos/meet_2020q4/v1/logo.png",
+        "https://a.slack-edge.com/80588/img/avatars/ava_0007.png",
+        "https://secure.gravatar.com/avatar/0123456789abcdef",
+        "https://notion.so/images/logo-for-slack-integration.png",
+    ],
+)
+def test_static_assets_are_not_reported_as_leaks(url):
+    assert noise.classify(PiiType.URL, url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://meet.google.com/okb-upyi-tku",
+        "https://docs.google.com/spreadsheets/d/1-cEpPMkSzEO3t0",
+        "https://www.notion.so/Ble-etim-gps-dispatch-accuracy-3ddfff",
+        "https://internal.example.com/hr/salaries.xlsx",
+    ],
+)
+def test_urls_that_identify_something_are_still_reported(url):
+    """A meeting code or a document id is not decoration."""
+    assert noise.classify(PiiType.URL, url) is None
+
+
+def test_an_asset_url_that_survives_is_ignored_not_leaked():
+    line = '"footer_icon": "https://a.slack-edge.com/80588/img/icon.png"'
+    report = verify(line, line)
+    assert report.leaks == []
+    assert report.ignored
+
+
 def test_scan_only_separates_structural_findings():
     result = scan_only('{"name": "team-001-discussion-1772942080303", "email": "a@example.com"}')
     assert {row["type"] for row in result["findings"]} == {"EMAIL"}

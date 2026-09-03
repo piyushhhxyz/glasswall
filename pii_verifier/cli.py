@@ -50,10 +50,50 @@ def _check(args: argparse.Namespace) -> int:
         print(f"verdict: {report.verdict}")
         for key, value in report.stats.items():
             print(f"  {key}: {value}")
-        for leak in report.leaks[:20]:
-            print(f"  LEAK [{leak['severity']}] {leak['type']}: {leak['text'][:80]!r} x{leak['occurrences']}")
-    # Non-zero exit on a leak so this can gate a pipeline.
-    return 1 if report.verdict == "leak" else 0
+        for label, rows in (("LEAK", report.leaks), ("PARTIAL", report.partials)):
+            for row in rows[:20]:
+                site = (row.get("in_redacted") or [{}])[0]
+                where = f" line {site['line']}" + (f" ({site['path']})" if site.get("path") else "") \
+                    if site.get("line") else ""
+                extra = ""
+                if row.get("fragments"):
+                    extra = "  survived: " + ", ".join(f["fragment"] for f in row["fragments"])
+                print(f"  {label} [{row['severity']}] {row['type']}: "
+                      f"{row['text'][:70]!r} x{row['occurrences']}{where}{extra}")
+    # Non-zero exit on anything that survived, so this can gate a pipeline.
+    return 1 if report.verdict in ("leak", "partial") else 0
+
+
+def _audit(args: argparse.Namespace) -> int:
+    """Verify a whole prefix and exit non-zero if anything survived."""
+    from . import audit as audit_module
+    from .s3 import S3Browser
+
+    result = audit_module.run(
+        S3Browser(Settings.from_env()), args.prefix,
+        max_files=args.max_files, max_depth=args.max_depth,
+    )
+    payload = result.to_json()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 1 if payload["flagged"] else 0
+
+    print(f"checked {payload['checked']} paired file(s) under {args.prefix or '(root)'}")
+    for verdict, count in sorted(payload["by_verdict"].items()):
+        print(f"  {verdict}: {count}")
+    for note in payload["notes"]:
+        print(f"  note: {note}")
+    for row in payload["files"]:
+        if row["verdict"] not in ("leak", "partial"):
+            continue
+        print(f"\n{row['verdict'].upper()} [{row.get('severity')}] {row['relative']}")
+        for finding in row.get("top", []):
+            where = f" line {finding['line']}" if finding.get("line") else ""
+            path = f" ({finding['path']})" if finding.get("path") else ""
+            frags = ("  survived: " + ", ".join(finding["fragments"])) if finding.get("fragments") else ""
+            print(f"    {finding['kind']:7} {finding['type']}: "
+                  f"{finding['text'][:60]!r}{where}{path}{frags}")
+    return 1 if payload["flagged"] else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -71,6 +111,13 @@ def main(argv: list[str] | None = None) -> int:
     check.add_argument("relative", help="key relative to the two roots, e.g. slack/general/2023-01-01.json")
     check.add_argument("--json", action="store_true")
     check.set_defaults(func=_check)
+
+    scan = sub.add_parser("audit", help="verify every paired file under a prefix")
+    scan.add_argument("prefix", nargs="?", default="", help="prefix relative to the two roots")
+    scan.add_argument("--max-files", type=int, default=200)
+    scan.add_argument("--max-depth", type=int, default=6)
+    scan.add_argument("--json", action="store_true")
+    scan.set_defaults(func=_audit)
 
     args = parser.parse_args(argv)
     if not getattr(args, "func", None):

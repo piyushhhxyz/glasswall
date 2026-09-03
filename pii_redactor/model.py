@@ -29,10 +29,14 @@ class PiiType(str, Enum):
     BANK_ACCOUNT = "BANK_ACCOUNT"
     PASSPORT = "PASSPORT"
     ID_DOCUMENT = "ID_DOCUMENT"
+    # Machine credentials: API keys, tokens, webhooks, private keys.
+    SECRET = "SECRET"
 
 
 # Higher wins when two detections overlap by the same length.
 PRIORITY: dict[PiiType, int] = {
+    # Above URL: a Slack webhook is a URL, but the token in it is the point.
+    PiiType.SECRET: 110,
     PiiType.EMAIL: 100,
     PiiType.URL: 95,
     PiiType.IP: 94,
