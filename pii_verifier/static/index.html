@@ -1,0 +1,614 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PII Verifier</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161920; --panel-2: #1c2029; --line: #262b36;
+    --text: #dfe3ea; --dim: #8b93a3; --faint: #5b6373;
+    --accent: #5b9dff; --clean: #3fb950; --leak: #f85149; --warn: #d29922; --surrogate: #a371f7;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+
+  /* ---------- header ---------- */
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--line); flex-shrink: 0;
+  }
+  .brand { font-weight: 650; letter-spacing: -0.2px; }
+  .brand span { color: var(--accent); }
+  .roots { font: 11px/1.4 var(--mono); color: var(--dim); }
+  .roots b { color: var(--text); font-weight: 500; }
+  .spacer { flex: 1; }
+  .pill {
+    font: 11px var(--mono); padding: 3px 8px; border-radius: 999px;
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--dim);
+  }
+  .pill.ok { color: var(--clean); border-color: #1d4429; }
+  .pill.bad { color: var(--leak); border-color: #5c2427; }
+
+  /* ---------- layout ---------- */
+  main { flex: 1; display: flex; min-height: 0; }
+  #sidebar {
+    width: 380px; min-width: 240px; max-width: 60vw; flex-shrink: 0;
+    background: var(--panel); border-right: 1px solid var(--line);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  #content { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+  /* ---------- breadcrumbs + tree ---------- */
+  .crumbs {
+    padding: 8px 12px; border-bottom: 1px solid var(--line); font: 12px var(--mono);
+    display: flex; flex-wrap: wrap; gap: 4px; align-items: center; flex-shrink: 0;
+  }
+  .crumbs a { color: var(--accent); cursor: pointer; text-decoration: none; }
+  .crumbs a:hover { text-decoration: underline; }
+  .crumbs i { color: var(--faint); font-style: normal; }
+
+  /* Manual pairing: the escape hatch for folders renamed on both sides, where
+     nothing in the bucket says which pairs with which. */
+  .paths {
+    padding: 6px 12px; border-bottom: 1px solid var(--line); flex-shrink: 0;
+    display: grid; grid-template-columns: 1fr auto; gap: 4px 6px; align-items: center;
+  }
+  .paths label { display: flex; align-items: center; gap: 5px; font: 10px var(--mono); color: var(--faint); }
+  .paths input {
+    flex: 1; min-width: 0; padding: 3px 6px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 4px; color: var(--text); font: 11px var(--mono);
+  }
+  .paths input:focus { outline: none; border-color: var(--accent); }
+  .paths button {
+    grid-row: 1 / 3; padding: 6px 10px; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 4px; font: 11px var(--mono); cursor: pointer;
+  }
+  .paths button:hover { border-color: var(--accent); color: var(--accent); }
+
+  .filter { padding: 8px 12px; border-bottom: 1px solid var(--line); flex-shrink: 0; }
+  .filter input {
+    width: 100%; padding: 6px 8px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 6px; color: var(--text); font: 12px var(--mono);
+  }
+  .filter input:focus { outline: none; border-color: var(--accent); }
+
+  #tree { overflow-y: auto; flex: 1; padding: 4px 0; }
+  .row {
+    display: flex; align-items: center; gap: 8px; padding: 5px 12px; cursor: pointer;
+    font: 12px var(--mono); border-left: 2px solid transparent; white-space: nowrap;
+  }
+  .row:hover { background: var(--panel-2); }
+  .row.active { background: #1e2633; border-left-color: var(--accent); }
+  .row .ico { width: 14px; text-align: center; color: var(--faint); flex-shrink: 0; }
+  .row .nm { overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .row .tag {
+    font-size: 9px; padding: 1px 5px; border-radius: 3px; flex-shrink: 0;
+    letter-spacing: 0.4px; text-transform: uppercase;
+  }
+  .tag.both { background: #14301c; color: var(--clean); }
+  .tag.orig { background: #4a2f0a; color: var(--warn); }
+  .tag.red  { background: #2b1f4a; color: var(--surrogate); }
+  .tag.alias { background: #123240; color: #5cc8e8; }
+  .sz { color: var(--faint); font-size: 10px; flex-shrink: 0; }
+
+  /* ---------- verdict bar ---------- */
+  .verdict {
+    padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap; flex-shrink: 0;
+  }
+  .badge {
+    font-weight: 700; font-size: 12px; letter-spacing: 0.6px; text-transform: uppercase;
+    padding: 5px 12px; border-radius: 6px;
+  }
+  .badge.clean { background: #14301c; color: var(--clean); border: 1px solid #1d4429; }
+  .badge.leak { background: #3d1418; color: var(--leak); border: 1px solid #5c2427; }
+  .badge.no_pii, .badge.opaque, .badge.no_text { background: var(--panel-2); color: var(--dim); border: 1px solid var(--line); }
+  .badge.unpaired { background: #4a2f0a; color: var(--warn); border: 1px solid #6b4410; }
+  .path { font: 12px var(--mono); color: var(--dim); overflow: hidden; text-overflow: ellipsis; }
+  .stats { display: flex; gap: 16px; font-size: 12px; }
+  .stat b { display: block; font: 600 15px var(--mono); }
+  .stat s { display: block; text-decoration: none; color: var(--faint); font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; }
+
+  /* ---------- tabs ---------- */
+  .tabs { display: flex; gap: 2px; padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--line); flex-shrink: 0; }
+  .tab {
+    padding: 8px 14px; font-size: 12px; cursor: pointer; color: var(--dim);
+    border-bottom: 2px solid transparent; user-select: none;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.on { color: var(--text); border-bottom-color: var(--accent); }
+  .tab u { text-decoration: none; font: 10px var(--mono); background: var(--panel-2); padding: 1px 5px; border-radius: 3px; margin-left: 5px; }
+
+  .pane { flex: 1; overflow: auto; min-height: 0; display: none; }
+  .pane.on { display: block; }
+
+  /* ---------- diff ---------- */
+  table.diff { width: 100%; border-collapse: collapse; font: 12px/1.55 var(--mono); }
+  table.diff td { padding: 0 8px; vertical-align: top; white-space: pre-wrap; word-break: break-word; }
+  td.gut {
+    width: 1%; min-width: 44px; text-align: right; color: var(--faint); background: var(--panel);
+    user-select: none; border-right: 1px solid var(--line); font-size: 11px; white-space: nowrap;
+  }
+  td.txt { width: 49%; }
+  tr.replace td.txt.l, tr.delete td.txt.l { background: #2d1618; }
+  tr.replace td.txt.r, tr.insert td.txt.r { background: #12261a; }
+  tr.skip td { background: var(--panel-2); color: var(--faint); text-align: center; font-size: 11px; padding: 3px; }
+  mark.pii { background: #3b3520; color: #f0d78c; border-radius: 2px; padding: 0 1px; }
+  mark.leakhit { background: var(--leak); color: #fff; border-radius: 2px; padding: 0 1px; font-weight: 600; }
+  .colhead {
+    display: flex; position: sticky; top: 0; z-index: 2; background: var(--panel-2);
+    border-bottom: 1px solid var(--line); font: 11px var(--mono); color: var(--dim);
+  }
+  .colhead div { flex: 1; padding: 5px 12px; }
+  .colhead div:first-child { border-right: 1px solid var(--line); }
+
+  /* ---------- findings tables ---------- */
+  table.list { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.list th {
+    text-align: left; padding: 7px 12px; background: var(--panel-2); color: var(--dim);
+    font: 10px var(--mono); text-transform: uppercase; letter-spacing: 0.5px;
+    position: sticky; top: 0; border-bottom: 1px solid var(--line);
+  }
+  table.list td { padding: 7px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.list td.v { font: 12px var(--mono); word-break: break-all; }
+  table.list tr:hover td { background: var(--panel); }
+  .sev { font: 10px var(--mono); padding: 2px 6px; border-radius: 3px; text-transform: uppercase; }
+  .sev.critical { background: #3d1418; color: var(--leak); }
+  .sev.high { background: #4a1f10; color: #ff8a65; }
+  .sev.medium { background: #4a3a0a; color: var(--warn); }
+  .sev.low { background: var(--panel-2); color: var(--dim); }
+  .ty { font: 11px var(--mono); color: var(--accent); }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; padding: 10px 16px; }
+  .chip { font: 11px var(--mono); padding: 3px 8px; border-radius: 4px; background: var(--panel-2); color: var(--dim); }
+  .chip b { color: var(--text); }
+
+  /* ---------- media side-by-side ---------- */
+  .media { display: flex; gap: 1px; background: var(--line); }
+  .media > div {
+    flex: 1; min-width: 0; background: var(--bg); padding: 12px;
+    display: flex; flex-direction: column; gap: 8px; align-items: center;
+  }
+  .media h4 {
+    margin: 0; font: 11px var(--mono); color: var(--dim); text-transform: uppercase;
+    letter-spacing: 0.5px; align-self: stretch;
+  }
+  .media img {
+    max-width: 100%; max-height: 60vh; object-fit: contain;
+    background: repeating-conic-gradient(#2a2f3a 0% 25%, #1c2029 0% 50%) 50%/16px 16px;
+    border: 1px solid var(--line); border-radius: 4px;
+  }
+  .media .miss { color: var(--faint); font: 12px var(--mono); padding: 40px 0; }
+  .bytes { font: 11px var(--mono); color: var(--faint); align-self: stretch; }
+
+  .empty { padding: 40px; text-align: center; color: var(--faint); }
+  .msg { padding: 12px 16px; margin: 12px 16px; border-radius: 6px; background: #3d1418; color: #ffb3ae; font-size: 12px; border: 1px solid #5c2427; }
+  .msg.warn { background: #3a2a08; color: #ffd98a; border-color: #6b4410; }
+  .msg.info { background: var(--panel-2); color: var(--dim); border-color: var(--line); }
+  .spin { padding: 30px; text-align: center; color: var(--dim); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="brand">PII <span>Verifier</span></div>
+    <div class="roots" id="roots">connecting…</div>
+  </div>
+  <div class="spacer"></div>
+  <div class="pill" id="identity">checking credentials…</div>
+</header>
+
+<main>
+  <aside id="sidebar">
+    <div class="crumbs" id="crumbs"></div>
+    <div class="paths">
+      <label>orig<input id="pathO" spellcheck="false" placeholder="(root)"></label>
+      <label>red <input id="pathR" spellcheck="false" placeholder="(root)"></label>
+      <button id="pathGo" title="browse these two paths as a pair">pair</button>
+    </div>
+    <div class="filter"><input id="filter" placeholder="filter this folder…" autocomplete="off"></div>
+    <div id="tree"><div class="spin">loading…</div></div>
+  </aside>
+
+  <section id="content">
+    <div class="empty" id="placeholder">
+      Pick a file on the left.<br><br>
+      <span style="font-size:12px">
+        Files marked <span class="tag both">both</span> exist on each side and get a full before/after verification.
+      </span>
+    </div>
+    <div id="detail" style="display:none; flex-direction:column; flex:1; min-height:0;">
+      <div class="verdict" id="verdict"></div>
+      <div class="tabs" id="tabs"></div>
+      <div class="pane" id="pane-diff"></div>
+      <div class="pane" id="pane-leaks"></div>
+      <div class="pane" id="pane-ignored"></div>
+      <div class="pane" id="pane-all"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const PANES = ["diff", "leaks", "ignored", "all"];
+let state = { prefix: "", entries: [], selected: null, data: null, tab: "diff" };
+
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+const fmtSize = (n) => n == null ? "" :
+  n < 1024 ? n + "B" : n < 1048576 ? (n/1024).toFixed(0) + "K" : (n/1048576).toFixed(1) + "M";
+
+/* Findings arrive as values, not per-line offsets, so matching is per rendered
+   line. Longest-first, so an address wins over the pincode inside it. */
+function buildMatcher(values, cap = 400) {
+  const parts = [...new Set(values.filter(v => v && v.length >= 3))]
+    .sort((a, b) => b.length - a.length)
+    .slice(0, cap)
+    // Whitespace may have been re-wrapped or removed outright; \s* covers both.
+    .map(v => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s*"));
+  if (!parts.length) return null;
+  try { return new RegExp("(" + parts.join("|") + ")", "gi"); } catch { return null; }
+}
+
+function highlight(text, matcher, cls) {
+  if (text == null) return "";
+  if (!matcher) return esc(text);
+  let out = "", last = 0;
+  matcher.lastIndex = 0;
+  for (let m; (m = matcher.exec(text)); ) {
+    if (m.index < last) { matcher.lastIndex = last; continue; }
+    out += esc(text.slice(last, m.index)) + `<mark class="${cls}">` + esc(m[0]) + "</mark>";
+    last = m.index + m[0].length;
+    if (m[0].length === 0) matcher.lastIndex++;
+  }
+  return out + esc(text.slice(last));
+}
+
+/* ---------------- navigation ---------------- */
+async function api(path, params) {
+  const url = new URL(path, location.origin);
+  Object.entries(params || {}).forEach(([k, v]) => v != null && url.searchParams.set(k, v));
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+async function loadConfig() {
+  try {
+    const c = await api("/api/config");
+    $("roots").innerHTML =
+      `s3://<b>${esc(c.bucket)}</b> · <b>${esc(c.original_root || "/")}</b> → <b>${esc(c.redacted_root || "/")}</b> · ${esc(c.region)}`;
+    const id = c.identity;
+    $("identity").className = "pill " + (id.ok ? "ok" : "bad");
+    $("identity").textContent = id.ok ? (id.arn.split("/").pop() || id.account) : "credentials failed";
+    $("identity").title = id.ok ? id.arn : id.error;
+  } catch (e) {
+    $("identity").className = "pill bad";
+    $("identity").textContent = "config error";
+  }
+}
+
+/* Both paths are tracked, because redaction renames path components: once a
+   renamed folder is entered the two sides no longer share a path. */
+async function browse(prefix, prefixRedacted) {
+  state.prefix = prefix;
+  state.prefixRedacted = prefixRedacted ?? prefix;
+  $("tree").innerHTML = '<div class="spin">loading…</div>';
+  renderCrumbs();
+  try {
+    const data = await api("/api/browse", {
+      prefix,
+      prefix_redacted: state.prefixRedacted === prefix ? null : state.prefixRedacted,
+    });
+    state.entries = data.entries;
+    renderTree(data);
+  } catch (e) {
+    $("tree").innerHTML = `<div class="msg">${esc(e.message)}</div>`;
+  }
+}
+
+function renderCrumbs() {
+  // Structural pairing preserves depth, so the two paths have the same number of
+  // segments and each crumb can carry both sides.
+  const parts = state.prefix.split("/").filter(Boolean);
+  const partsRed = (state.prefixRedacted || state.prefix).split("/").filter(Boolean);
+  let acc = "", accRed = "", html = `<a data-p="" data-pr="">root</a>`;
+  parts.forEach((part, i) => {
+    acc += part + "/";
+    accRed += (partsRed[i] ?? part) + "/";
+    const renamed = partsRed[i] && partsRed[i] !== part;
+    html += `<i>/</i><a data-p="${esc(acc)}" data-pr="${esc(accRed)}"
+      ${renamed ? `title="redacted side: ${esc(partsRed[i])}" style="border-bottom:1px dotted var(--surrogate)"` : ""}
+      >${esc(part)}</a>`;
+  });
+  $("crumbs").innerHTML = html;
+  $("crumbs").querySelectorAll("a").forEach(a =>
+    a.onclick = () => browse(a.dataset.p, a.dataset.pr));
+  $("pathO").value = state.prefix;
+  $("pathR").value = state.prefixRedacted || state.prefix;
+}
+
+/* Typing the two paths is the only correct answer for folders that are renamed
+   on both sides and shaped identically — nothing in the bucket distinguishes
+   them, so the pairing has to come from the person who knows. */
+function pairManually() {
+  const tidy = (v) => v.trim().replace(/^\/+/, "");
+  const o = tidy($("pathO").value), r = tidy($("pathR").value);
+  browse(o.endsWith("/") || !o ? o : o + "/", r.endsWith("/") || !r ? r : r + "/");
+}
+$("pathGo").onclick = pairManually;
+["pathO", "pathR"].forEach(id =>
+  $(id).addEventListener("keydown", e => { if (e.key === "Enter") pairManually(); }));
+
+function renderTree(data) {
+  const q = $("filter").value.toLowerCase();
+  const rows = state.entries.filter(e => !q || e.name.toLowerCase().includes(q));
+  if (!rows.length) {
+    $("tree").innerHTML = `<div class="empty" style="padding:24px;font-size:12px">${
+      data.errors?.length ? esc(data.errors.join("; ")) : "nothing here"}</div>`;
+    return;
+  }
+  const html = rows.map(e => {
+    const tag = e.in_original && e.in_redacted
+      ? (e.matched_by === "structure"
+          ? '<span class="tag alias" title="renamed by the redaction; paired by contents">renamed</span>'
+          : '<span class="tag both">both</span>')
+      : e.in_original ? '<span class="tag orig">orig only</span>'
+      : '<span class="tag red">redacted only</span>';
+    const size = e.is_dir ? "" : `<span class="sz">${fmtSize(e.redacted_size ?? e.original_size)}</span>`;
+    const active = state.selected === e.relative ? " active" : "";
+    const title = e.redacted_name ? `${e.name}  →  ${e.redacted_name}` : e.name;
+    return `<div class="row${active}" data-r="${esc(e.relative)}"
+        data-rr="${esc(e.relative_redacted)}" data-d="${e.is_dir ? 1 : 0}">
+      <span class="ico">${e.is_dir ? "▸" : "·"}</span>
+      <span class="nm" title="${esc(title)}">${esc(e.name)}</span>
+      ${size}${tag}</div>`;
+  }).join("");
+  let note = data.truncated
+    ? `<div class="msg warn">Listing truncated at ${rows.length} entries — narrow it with the filter or step into a subfolder.</div>` : "";
+  for (const n of data.notes || []) note += `<div class="msg info">${esc(n)}</div>`;
+  $("tree").innerHTML = note + html;
+  $("tree").querySelectorAll(".row").forEach(row => {
+    row.onclick = () => row.dataset.d === "1"
+      ? browse(row.dataset.r, row.dataset.rr)
+      : openFile(row.dataset.r, row.dataset.rr);
+  });
+}
+
+$("filter").oninput = () => renderTree({ truncated: false });
+
+/* ---------------- file detail ---------------- */
+async function openFile(relative, relativeRedacted) {
+  state.selected = relative;
+  state.selectedRedacted = relativeRedacted ?? relative;
+  renderTree({ truncated: false });
+  $("placeholder").style.display = "none";
+  $("detail").style.display = "flex";
+  $("verdict").innerHTML = `<span class="path">${esc(relative)}</span>`;
+  $("tabs").innerHTML = "";
+  PANES.forEach(t => $("pane-" + t).innerHTML = "");
+  $("pane-diff").innerHTML = '<div class="spin">fetching both sides and scanning…</div>';
+  $("pane-diff").classList.add("on");
+
+  try {
+    state.data = await api("/api/compare", {
+      relative,
+      relative_redacted: state.selectedRedacted === relative ? null : state.selectedRedacted,
+    });
+    render();
+  } catch (e) {
+    $("pane-diff").innerHTML = `<div class="msg">${esc(e.message)}</div>`;
+  }
+}
+
+function render() {
+  const d = state.data;
+  const r = d.report;
+  const label = { clean: "no leaks", leak: "leak found", no_pii: "no pii detected",
+                  unpaired: "unpaired", opaque: "binary — bytes only",
+                  no_text: "no text extracted" }[d.verdict] || d.verdict;
+
+  let stats = "";
+  if (r) {
+    const s = r.stats;
+    stats = `<div class="stats">
+      <div class="stat"><b>${s.distinct_before}</b><s>pii in original</s></div>
+      <div class="stat"><b style="color:${s.leaked ? "var(--leak)" : "var(--clean)"}">${s.leaked}</b><s>leaked</s></div>
+      <div class="stat"><b>${s.removed}</b><s>removed</s></div>
+      <div class="stat"><b>${s.surrogates}</b><s>surrogates</s></div>
+      ${s.ignored ? `<div class="stat"><b style="color:var(--dim)">${s.ignored}</b><s>structural</s></div>` : ""}
+      <div class="stat"><b>${s.redaction_rate == null ? "—" : s.redaction_rate + "%"}</b><s>redacted</s></div>
+    </div>`;
+  }
+  $("verdict").innerHTML = `<span class="badge ${d.verdict}">${label}</span>
+    <span class="path">${esc(d.relative)}</span><div class="spacer"></div>${stats}`;
+
+  // Tabs are built from what this file actually produced.
+  const tabs = [];
+  if (d.diff) tabs.push(["diff", "Side by side", d.diff.changed_lines || null]);
+  if (r) {
+    tabs.push(["leaks", "Leaks", r.leaks.length || null]);
+    if (r.ignored.length) tabs.push(["ignored", "Structural", r.ignored.length]);
+    tabs.push(["all", "All findings", r.stats.distinct_before || null]);
+  } else if (d.scan) {
+    tabs.push(["all", "Findings", d.scan.distinct || null]);
+    if (d.scan.ignored?.length) tabs.push(["ignored", "Structural", d.scan.ignored.length]);
+  }
+  $("tabs").innerHTML = tabs.map(([k, t, n]) =>
+    `<div class="tab" data-t="${k}">${t}${n ? `<u>${n}</u>` : ""}</div>`).join("");
+  $("tabs").querySelectorAll(".tab").forEach(t => t.onclick = () => showTab(t.dataset.t));
+
+  renderDiff();
+  renderLeaks();
+  renderIgnored();
+  renderAll();
+  showTab(tabs.length && !tabs.some(t => t[0] === state.tab) ? tabs[0][0] : state.tab);
+}
+
+function showTab(which) {
+  state.tab = which;
+  PANES.forEach(t => {
+    $("pane-" + t).classList.toggle("on", t === which);
+  });
+  $("tabs").querySelectorAll(".tab").forEach(t => t.classList.toggle("on", t.dataset.t === which));
+}
+
+/* Images are verified by eye: the redactor paints over PII in pixels, so both
+   versions are rendered rather than diffed. Any OCR'd text still gets a diff
+   underneath. */
+function renderMedia(om, rm) {
+  const paths = {
+    original: encodeURIComponent(state.data.relative),
+    redacted: encodeURIComponent(state.data.relative_redacted || state.data.relative),
+  };
+  const cell = (label, meta, side) => {
+    const body = !meta.exists
+      ? `<div class="miss">no file on this side</div>`
+      : meta.media_type
+        ? `<img src="/api/raw?side=${side}&relative=${paths[side]}" alt="${esc(label)}"
+             onerror="this.replaceWith(Object.assign(document.createElement('div'),
+               {className:'miss',textContent:'browser cannot display this format'}))">`
+        : `<div class="miss">${esc(meta.kind || "no preview")}</div>`;
+    return `<div><h4>${label} · ${esc(meta.kind || "")}</h4>${body}
+      <div class="bytes">${meta.exists ? `${fmtSize(meta.bytes)} · sha256 ${esc(meta.digest || "")}` : ""}</div></div>`;
+  };
+  return `<div class="media">${cell("ORIGINAL", om, "original")}${cell("REDACTED", rm, "redacted")}</div>`;
+}
+
+function renderDiff() {
+  const d = state.data, pane = $("pane-diff");
+  const om = d.original.meta, rm = d.redacted.meta;
+
+  let notes = "";
+  if (d.verdict === "unpaired")
+    notes += `<div class="msg warn">No counterpart on the <b>${esc(d.missing)}</b> side, so there is nothing to compare.
+      The scan below ran on the side that exists. In this export that usually means the redaction run never wrote the file —
+      its own summary reports the rewrite phase failed with 147 files unfinished.</div>`;
+  if (d.bytes_identical && d.verdict !== "unpaired")
+    notes += `<div class="msg warn">Both sides are byte-for-byte identical — this file was not rewritten.</div>`;
+  if (d.verdict === "opaque")
+    notes += `<div class="msg info">This format carries no readable text, so it is compared by size and
+      digest only${d.bytes_identical ? "" : ` — ${fmtSize(om.bytes)} vs ${fmtSize(rm.bytes)}, and the digests differ`}.</div>`;
+  if (d.verdict === "no_text")
+    notes += `<div class="msg info">No text could be extracted from either side.</div>`;
+  [["original", om], ["redacted", rm]].forEach(([side, m]) => {
+    if (m.error) notes += `<div class="msg">${esc(side)}: ${esc(m.error)}</div>`;
+    else if (m.truncated) notes += `<div class="msg warn">${esc(side)} truncated to ${fmtSize(m.bytes)} — scan and diff cover the first part only.</div>`;
+    else if (m.note) notes += `<div class="msg info">${esc(side)}: ${esc(m.note)}</div>`;
+  });
+
+  // Renderable content (images) gets the visual pair; text still diffs below it.
+  const media = d.renderable ? renderMedia(om, rm) : "";
+
+  if (!d.diff || !d.diff.rows.length) {
+    pane.innerHTML = notes + media + (media
+      ? ""
+      : `<div class="empty">No text to place side by side for this file.<br>
+         <span style="font-size:12px">${esc(om.note || rm.note || om.kind || "")}</span></div>`);
+    return;
+  }
+
+  // Left pane marks everything detected in the original; the right pane marks
+  // only leaks, so a surviving value stands out from the surrogates around it.
+  const r = state.data.report;
+  const leakM = buildMatcher(r ? r.leaks.map(l => l.text) : []);
+  const beforeM = buildMatcher(r ? [...r.leaks, ...r.redacted].map(l => l.text) : []);
+
+  const body = d.diff.rows.map(row => {
+    if (row.tag === "skip")
+      return `<tr class="skip"><td colspan="4">⋯ ${esc(row.left)} ⋯</td></tr>`;
+    return `<tr class="${row.tag}">
+      <td class="gut">${row.left_no ?? ""}</td>
+      <td class="txt l">${highlight(row.left, beforeM, "pii")}</td>
+      <td class="gut">${row.right_no ?? ""}</td>
+      <td class="txt r">${highlight(row.right, leakM, "leakhit")}</td></tr>`;
+  }).join("");
+
+  pane.innerHTML = notes + media +
+    `<div class="colhead"><div>ORIGINAL · ${esc(om.kind || "")} · ${fmtSize(om.bytes)}</div>
+      <div>REDACTED · ${esc(rm.kind || "")} · ${fmtSize(rm.bytes)}</div></div>
+    <table class="diff"><tbody>${body}</tbody></table>` +
+    (d.diff.truncated ? `<div class="msg warn">Diff truncated at ${d.diff.rows.length} rows.</div>` : "");
+}
+
+function findingRows(rows) {
+  return rows.map(f => `<tr>
+    <td><span class="sev ${f.severity}">${f.severity}</span></td>
+    <td><span class="ty">${esc(f.type)}</span></td>
+    <td class="v">${esc(f.text.length > 200 ? f.text.slice(0, 200) + "…" : f.text)}</td>
+    <td>${f.occurrences ?? 1}</td>
+    <td style="color:var(--faint);font:11px var(--mono)">${esc(f.detector)}</td></tr>`).join("");
+}
+
+function renderLeaks() {
+  const r = state.data.report;
+  if (!r) return;
+  const pane = $("pane-leaks");
+  if (!r.leaks.length) {
+    pane.innerHTML = `<div class="empty">
+      <div style="color:var(--clean);font-size:15px;font-weight:600">No original values survived.</div>
+      <div style="margin-top:8px;font-size:12px">
+        All ${r.stats.in_scope} distinct in-scope PII values found in the original are absent from the redacted file.
+        ${r.stats.ignored ? `<br>${r.stats.ignored} further match${r.stats.ignored > 1 ? "es were" : " was"} set aside as machine structure — see the Structural tab.` : ""}
+      </div></div>`;
+    return;
+  }
+  pane.innerHTML = `<div class="msg">${r.leaks.length} value${r.leaks.length > 1 ? "s" : ""} detected in the original
+    still appear verbatim in the redacted file.</div>
+    <table class="list"><thead><tr><th>severity</th><th>type</th><th>value</th><th>count</th><th>detector</th></tr></thead>
+    <tbody>${findingRows(r.leaks)}</tbody></table>`;
+}
+
+function renderIgnored() {
+  const d = state.data;
+  const rows = d.report ? d.report.ignored : (d.scan?.ignored || []);
+  if (!rows.length) return;
+  $("pane-ignored").innerHTML = `<div class="msg info">
+      These matched a PII pattern and are unchanged between the two sides, but they are
+      machine structure rather than personal data, so they are not counted as leaks or
+      against the redaction rate. Each row says why.
+    </div>
+    <table class="list"><thead><tr><th>severity</th><th>type</th><th>value</th><th>count</th><th>set aside because</th></tr></thead>
+    <tbody>${rows.map(f => `<tr>
+      <td><span class="sev ${f.severity}">${f.severity}</span></td>
+      <td><span class="ty">${esc(f.type)}</span></td>
+      <td class="v">${esc(f.text.length > 200 ? f.text.slice(0, 200) + "…" : f.text)}</td>
+      <td>${f.occurrences ?? 1}</td>
+      <td style="color:var(--dim)">${esc(f.ignored_because || "")}</td></tr>`).join("")}
+    </tbody></table>`;
+}
+
+function renderAll() {
+  const d = state.data, pane = $("pane-all");
+  const chips = (counts) => Object.entries(counts || {}).map(([k, v]) =>
+    `<span class="chip">${esc(k)} <b>${v}</b></span>`).join("") || '<span class="chip">none</span>';
+
+  if (d.scan) {
+    pane.innerHTML = `<div class="chips">${chips(d.scan.counts)}</div>
+      <table class="list"><thead><tr><th>severity</th><th>type</th><th>value</th><th>count</th><th>detector</th></tr></thead>
+      <tbody>${findingRows(d.scan.findings)}</tbody></table>`;
+    return;
+  }
+  const r = d.report;
+  if (!r) { pane.innerHTML = `<div class="empty">Nothing scanned.</div>`; return; }
+  pane.innerHTML = `
+    <div class="chips"><span class="chip" style="color:var(--faint)">ORIGINAL</span>${chips(r.before_counts)}</div>
+    <div class="chips"><span class="chip" style="color:var(--faint)">REDACTED</span>${chips(r.after_counts)}</div>
+    <table class="list"><thead><tr><th>severity</th><th>type</th><th>value</th><th>count</th><th>detector</th></tr></thead>
+    <tbody>${findingRows([...r.leaks, ...r.redacted])}</tbody></table>
+    <div class="chips" style="border-top:1px solid var(--line);margin-top:8px">
+      <span class="chip" style="color:var(--surrogate)">SURROGATES INTRODUCED · ${r.surrogates.length}</span>
+    </div>
+    <table class="list"><tbody>${findingRows(r.surrogates.slice(0, 300))}</tbody></table>`;
+}
+
+loadConfig();
+browse("");
+</script>
+</body>
+</html>
