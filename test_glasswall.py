@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests. Run with: python3 test_glasswaller.py
+"""Tests. Run with: python3 test_glasswall.py
 
 Pairing and layout detection run on synthetic trees, so they check the logic
 rather than one batch's quirks. The end-to-end tests boot a real server and
@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pairing
 import render
-import glasswaller
+import glasswall
 import stores
 
 #: A real export to run the end-to-end tests against. Point GLASSWALL_SAMPLE

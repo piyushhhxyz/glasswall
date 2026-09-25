@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Side-by-side review of a redaction run: source on the left, output on the right.
 
-    python3 glasswaller.py                       # asks for the two locations in the browser
-    python3 glasswaller.py --left A --right B    # skips the setup screen
+    python3 glasswall.py                       # asks for the two locations in the browser
+    python3 glasswall.py --left A --right B    # skips the setup screen
 
 Either side may be a folder, a .zip, or an s3:// prefix. Verdicts persist to
 marks.json keyed by the pair of locations, so closing the tab and coming back
@@ -2331,7 +2331,7 @@ addEventListener("keydown",e=>{
    you drag, and remembered per browser. */
 (function(){
   const g=el("grip"), bd=el("body");
-  const SW="glasswaller.sidewidth";
+  const SW="glasswall.sidewidth";
   const set=w=>{w=Math.max(170,Math.min(760,Math.round(w)));
     bd.style.setProperty("--sw",w+"px"); return w;};
   const saved=parseInt(localStorage.getItem(SW)||"",10);
@@ -2446,7 +2446,7 @@ PER_APP = 100
 #: Where this laptop's sampling salt lives. In the home directory rather than
 #: beside the code, so it survives re-cloning the repo and stays one identity
 #: per machine rather than one per checkout.
-SALT_FILE = Path.home() / ".glasswaller-salt"
+SALT_FILE = Path.home() / ".glasswall-salt"
 
 
 def reviewer_salt(override: str | None = None) -> str:
@@ -3091,7 +3091,7 @@ def _fan_out(jobs, a) -> int:
         # unreadable braid, and the one thing a person needs from this command
         # is a clean list of URLs. A file, not a pipe: nobody is draining
         # these while they run, and a full pipe buffer would wedge the child.
-        log = tempfile.NamedTemporaryFile(prefix="glasswaller-", suffix=".log",
+        log = tempfile.NamedTemporaryFile(prefix="glasswall-", suffix=".log",
                                           delete=False)
         kids.append(subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT))
         logs.append(log.name)
