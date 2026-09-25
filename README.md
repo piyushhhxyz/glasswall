@@ -1,19 +1,19 @@
-# Glasswall
+# Glasswaller
 
 **See everything. Touch nothing.**
 
 Source on the left, what the pipeline produced on the right. Eyeball a hundred
 documents in a sitting without touching the mouse.
 
-Glasswall is read-only by construction. It opens an export and its redacted
+Glasswaller is read-only by construction. It opens an export and its redacted
 counterpart side by side, pairs the files up, and shows you what changed. It
 never writes to the locations it reads.
 
 ## Run it
 
 ```
-cd ~/Desktop/glasswall
-./glasswall
+cd ~/Desktop/glasswaller
+./glasswaller
 ```
 
 A popup asks where the run is. Give it **one** location — a folder, a zip, or
@@ -28,9 +28,9 @@ that output belongs to, so both halves are there to compare.
 Skip the popup:
 
 ```
-./glasswall ~/Downloads/some-export
-./glasswall s3://bucket/export --profile sail
-./glasswall 'https://s3.console.aws.amazon.com/s3/buckets/bkt?region=ap-south-1&prefix=_pii/output/' --profile sail
+./glasswaller ~/Downloads/some-export
+./glasswaller s3://bucket/export --profile sail
+./glasswaller 'https://s3.console.aws.amazon.com/s3/buckets/bkt?region=ap-south-1&prefix=_pii/output/' --profile sail
 ```
 
 Quote a console URL — the `&` will otherwise background your shell.
@@ -42,9 +42,9 @@ tab on its own port. Verdicts are keyed by the pair of locations, so the tabs
 never overwrite each other.
 
 ```
-./glasswall ~/Downloads/run-a ~/Downloads/run-b ~/Downloads/run-c
+./glasswaller ~/Downloads/run-a ~/Downloads/run-b ~/Downloads/run-c
 
-./glasswall --profile sail \
+./glasswaller --profile sail \
   --pair s3://bkt/export s3://bkt/export-pii \
   --pair s3://bkt/export/unit-a s3://bkt/export-pii/unit-a
 ```
@@ -62,7 +62,7 @@ login does not reach it. Two ways in.
 
 ```
 aws sso login --profile sail
-./glasswall s3://bucket/prefix --profile sail
+./glasswaller s3://bucket/prefix --profile sail
 ```
 
 To see which accounts that login actually covers — buckets outside them will
@@ -95,7 +95,7 @@ aws_secret_access_key = ...
 ```
 chmod 600 ~/.aws/credentials
 aws sts get-caller-identity --profile some-client    # confirms which account
-./glasswall s3://client-bucket/their-export --profile some-client
+./glasswaller s3://client-bucket/their-export --profile some-client
 ```
 
 **If it will not open**, run the listing by hand — the error names the missing
@@ -139,7 +139,7 @@ tinted. The folder each document sits in is also printed above its pane,
 source against output.
 
 Two people on the same run get different files. The sample is seeded on a salt
-kept in `~/.glasswall-salt`, written once per machine — so your files stay the
+kept in `~/.glasswaller-salt`, written once per machine — so your files stay the
 same across refreshes and re-clones, and your colleague's hundred is a
 different hundred. On one real export two reviewers covered 631 files between
 them instead of 340.
@@ -148,7 +148,7 @@ To review exactly what someone else is reviewing, pass their sample id (it is
 printed on startup and shown in the header):
 
 ```
-./glasswall --pair SRC OUT --profile sail --seed 256028
+./glasswaller --pair SRC OUT --profile sail --seed 256028
 ```
 
 Press `m`, or the **PII-mappings** button, for the run's substitution table:
@@ -161,8 +161,8 @@ point at it — either on the command line or in the panel itself, which asks
 when the run shipped none:
 
 ```
-./glasswall --pair SRC OUT --profile sail --mappings ~/runs/_pii/pii_mappings.db
-./glasswall --pair SRC OUT --profile sail --mappings s3://bucket/run/_pii/pii_mappings.db
+./glasswaller --pair SRC OUT --profile sail --mappings ~/runs/_pii/pii_mappings.db
+./glasswaller --pair SRC OUT --profile sail --mappings s3://bucket/run/_pii/pii_mappings.db
 ```
 
 Verdicts save to `marks.json` as you go, keyed by the pair of locations, so

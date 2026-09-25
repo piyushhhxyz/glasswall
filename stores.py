@@ -503,12 +503,64 @@ class S3Store(Store):
         return self._aws("s3", "cp", f"s3://{self.bucket}/{key}", "-")
 
 
+class GcsStore(S3Store):
+    """A GCS prefix, over the ``gcloud storage`` CLI.
+
+    Google's client library is not a dependency here and its credentials are a
+    separate login from the CLI's, so the CLI is the only backend that works
+    wherever gcloud already does. Everything else - pairing, the branch
+    descent, the key cap - is S3Store's; only the two shell calls differ.
+    """
+
+    kind = "gcs"
+
+    def __init__(self, spec: str, profile: str | None = None,
+                 region: str | None = None, cap: int | None = -1):
+        Store.__init__(self, spec)
+        rest = spec[len("gs://"):].strip("/")
+        self.bucket, _, self.prefix = rest.partition("/")
+        self.profile = self.region = None
+        self.cap = self.DEFAULT_CAP if cap == -1 else (cap or 0)
+        self.capped = False
+        self._client = None          # forces S3Store onto its CLI paths
+        self._size_map: dict[str, int] = {}
+
+    def _aws(self, *args: str) -> bytes:
+        """Answer S3Store's two CLI shapes with gcloud."""
+        if args[:2] == ("s3", "ls"):
+            uri = args[2].replace("s3://", "gs://", 1).rstrip("/") + "/**"
+            done = subprocess.run(["gcloud", "storage", "ls", "-l", uri],
+                                  capture_output=True)
+            if done.returncode != 0:
+                raise RuntimeError(done.stderr.decode()[:400] or "gcloud failed")
+            lines = []
+            for raw in done.stdout.decode("utf-8", "replace").splitlines():
+                bits = raw.split(None, 2)
+                if len(bits) != 3 or not bits[2].startswith("gs://"):
+                    continue
+                key = bits[2][len(f"gs://{self.bucket}/"):]
+                size = bits[0] if bits[0].isdigit() else "0"
+                # S3Store's parser wants "date time size key".
+                lines.append(f"2026-01-01 00:00:00 {size} {key}")
+            return ("\n".join(lines) + "\n").encode()
+        if args[:2] == ("s3", "cp"):
+            uri = args[2].replace("s3://", "gs://", 1)
+            done = subprocess.run(["gcloud", "storage", "cat", uri],
+                                  capture_output=True)
+            if done.returncode != 0:
+                raise RuntimeError(done.stderr.decode()[:400] or "gcloud failed")
+            return done.stdout
+        raise RuntimeError(f"unsupported CLI shape: {args[:2]}")
+
+
 def open_store(spec: str, profile: str | None = None,
                cap: int | None = -1) -> Store:
     """Pick a backend from the shape of ``spec``. Raises with a usable message."""
     spec = (spec or "").strip()
     if not spec:
         raise ValueError("give a folder, a .zip, or an S3 location")
+    if spec.startswith("gs://"):
+        return GcsStore(spec, profile, None, cap)
     s3 = parse_s3(spec)
     if s3:
         return S3Store(s3[0], profile, s3[1], cap)
