@@ -62,7 +62,7 @@ class Store:
     kind = "?"
     #: Read-through cache. An S3 read is a network round trip and the viewer
     #: asks for the same bytes again every time you step back one document.
-    CACHE_MAX = 16
+    CACHE_MAX = 40
 
     def __init__(self, spec: str):
         self.spec = spec
