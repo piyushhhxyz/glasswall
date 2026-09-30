@@ -22,6 +22,10 @@ import render
 import glasswall
 import stores
 
+#: The module was review.py before it was glasswall.py. The tests still
+#: say review, and renaming 59 call sites buys nothing.
+review = glasswall
+
 #: A real export to run the end-to-end tests against. Point GLASSWALL_SAMPLE
 #: at one holding <unit>/raw/... and <unit>/files/...; without it those tests
 #: skip and the rest still run.
@@ -611,7 +615,8 @@ class Viewing(unittest.TestCase):
                            ("a.png", b"\x89PNG"), ("a.pdf", b"%PDF-1.4"),
                            ("a.weird", b"\xff\xfe\x00\x01")):
             self.assertIn(review.view(name, data)["kind"],
-                          {"table", "text", "records", "image", "pdf", "other"}, name)
+                          {"table", "text", "records", "image", "pdf", "other",
+                           "empty"}, name)
 
 
 class Layout(unittest.TestCase):
@@ -969,9 +974,6 @@ class Highlighting(unittest.TestCase):
                          ["Tatum Wilde", "Tatum"])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
 
 class FolderNames(unittest.TestCase):
     """A folder name is part of the deliverable and appears in neither pane."""
@@ -1107,3 +1109,407 @@ class SearchesEverything(unittest.TestCase):
         # search hit outside the sample names a row the server can open.
         self.assertTrue(all(r["id"] == int(r["label"][5:-5]) for r in kept))
         self.assertEqual(len(kept), 5)
+
+
+class Eml(unittest.TestCase):
+    """An exported .eml is RFC 5322 on the wire, not a text file.
+
+    Dumping the raw bytes into the pane cost two things: the reviewer read
+    MIME boundaries and base64 instead of the mail, and -- the one that
+    matters -- metrics() tokenised the encoded body, so an address the
+    rewriter MISSED inside a base64 or quoted-printable part produced no
+    removed tokens and the pair read as clean.
+    """
+
+    def eml(self, body: bytes, **hdr) -> bytes:
+        head = "".join(f"{k.replace('_', '-')}: {v}\r\n" for k, v in hdr.items())
+        return head.encode() + b"\r\n" + body
+
+    def test_a_base64_body_is_decoded(self):
+        import base64
+        secret = b"reach me at piyush@scalerailabs.com"
+        data = self.eml(base64.b64encode(secret),
+                        Content_Type="text/plain; charset=utf-8",
+                        Content_Transfer_Encoding="base64")
+        out = review.view("m.eml", data)
+        self.assertEqual(out["kind"], "text")
+        self.assertIn("piyush@scalerailabs.com", out["html"])
+        self.assertNotIn(base64.b64encode(secret).decode(), out["html"])
+
+    def test_a_quoted_printable_body_is_decoded(self):
+        data = self.eml(b"write to piyush=40scalerailabs=2Ecom plea=\r\nse",
+                        Content_Type="text/plain; charset=utf-8",
+                        Content_Transfer_Encoding="quoted-printable")
+        out = review.view("m.eml", data)
+        self.assertIn("piyush@scalerailabs.com", out["html"])
+        self.assertIn("please", out["html"])
+
+    def test_every_header_is_kept(self):
+        # Reading mail, Received/DKIM/X-* are noise worth hiding. Reviewing a
+        # REDACTION they are the opposite: the rewriter edits them, leaks into
+        # them, and mangles them, so a filtered header block hides defects.
+        data = self.eml(b"hi", From="a@b.com", To="c@d.com", Subject="Invoice",
+                        Date="Tue, 29 Sep 2026 10:00:00 +0530",
+                        Delivered_To="real.person@client.co.in",
+                        Received="from mx.example by relay",
+                        X_Mailer="Microsoft Outlook 16.0")
+        html = review.view("m.eml", data)["html"]
+        for keep in ("a@b.com", "c@d.com", "Invoice", "2026",
+                     "real.person@client.co.in", "mx.example", "X-Mailer"):
+            self.assertIn(keep, html)
+
+    def test_a_leak_in_a_transport_header_reaches_the_diff(self):
+        # The pane and metrics() share _doc_text. A header dropped from the
+        # render is a header the diff cannot score, so an address the rewriter
+        # missed in Delivered-To would produce no removed token.
+        data = self.eml(b"hi", From="a@b.com",
+                        Delivered_To="real.person@client.co.in")
+        self.assertIn("real.person@client.co.in",
+                      review._tokens(review._text_from_eml(data)))
+
+    def test_a_mangled_header_name_survives_to_the_pane(self):
+        # Seen in d1: the rewriter turned X-Mailer into X-Axlematic16. The
+        # reviewer cannot flag what the viewer filtered out.
+        data = self.eml(b"hi", From="a@b.com", X_Axlematic16="Microsoft Outlook 16.0")
+        self.assertIn("X-Axlematic16", review.view("m.eml", data)["html"])
+
+    def test_an_encoded_word_subject_is_decoded(self):
+        data = self.eml(b"hi", Subject="=?UTF-8?B?UGl5dXNoIEJoYXdzYXI=?=", From="a@b.com")
+        self.assertIn("Piyush Bhawsar", review.view("m.eml", data)["html"])
+
+    def test_multipart_prefers_the_plain_text_part(self):
+        data = (b"From: a@b.com\r\n"
+                b'Content-Type: multipart/alternative; boundary="XX"\r\n\r\n'
+                b"--XX\r\nContent-Type: text/plain\r\n\r\nplain body here\r\n"
+                b"--XX\r\nContent-Type: text/html\r\n\r\n<p>html body here</p>\r\n"
+                b"--XX--\r\n")
+        html = review.view("m.eml", data)["html"]
+        self.assertIn("plain body here", html)
+        self.assertNotIn("html body here", html)
+
+    def test_html_only_mail_is_reduced_to_text(self):
+        data = self.eml(b"<html><body><p>call 555-0123</p></body></html>",
+                        Content_Type="text/html; charset=utf-8")
+        html = review.view("m.eml", data)["html"]
+        self.assertIn("call 555-0123", html)
+        # The MAIL's markup must be gone, escaped or not -- the reviewer reads
+        # the message, not its tags. (The pane's own markup is not the mail's.)
+        self.assertNotIn("&lt;", html)
+        self.assertNotIn("<p>", html)
+
+    def test_an_attachment_is_listed_not_dumped(self):
+        import base64
+        blob = base64.b64encode(b"\x89PNG" + b"padding" * 400).decode()
+        data = (b"From: a@b.com\r\n"
+                b'Content-Type: multipart/mixed; boundary="XX"\r\n\r\n'
+                b"--XX\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n"
+                b"--XX\r\nContent-Type: image/png\r\n"
+                b'Content-Disposition: attachment; filename="scan.png"\r\n'
+                b"Content-Transfer-Encoding: base64\r\n\r\n"
+                + blob.encode() + b"\r\n--XX--\r\n")
+        html = review.view("m.eml", data)["html"]
+        self.assertIn("scan.png", html)
+        self.assertNotIn(blob[:60], html)
+
+    def test_the_diff_reads_the_decoded_body(self):
+        # The whole point. metrics() must tokenise the mail, not the base64.
+        import base64
+        data = self.eml(base64.b64encode(b"reach me at piyush@scalerailabs.com"),
+                        Content_Type="text/plain", Content_Transfer_Encoding="base64")
+
+        class Store:
+            def cached_read(self, key):
+                return data
+
+        text = review._doc_text("left", "s1", "m.eml", Store())
+        self.assertIn("piyush@scalerailabs.com", text)
+
+    # --- the Gmail-shaped pane ------------------------------------------
+
+    def xlsx_bytes(self):
+        import io as _io, zipfile as _zip
+        buf = _io.BytesIO()
+        with _zip.ZipFile(buf, "w") as z:
+            z.writestr("xl/sharedStrings.xml",
+                       '<sst xmlns="http://schemas.openxmlformats.org/'
+                       'spreadsheetml/2006/main"><si><t>Jenanira</t></si></sst>')
+            z.writestr("xl/worksheets/sheet1.xml",
+                       '<worksheet xmlns="http://schemas.openxmlformats.org/'
+                       'spreadsheetml/2006/main"><sheetData><row r="1">'
+                       '<c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>')
+            z.writestr("xl/workbook.xml",
+                       '<workbook xmlns="http://schemas.openxmlformats.org/'
+                       'spreadsheetml/2006/main"><sheets><sheet name="S" '
+                       'sheetId="1" r:id="rId1"/></sheets></workbook>')
+        return buf.getvalue()
+
+    def mail_with_attachment(self):
+        import base64
+        return (b"From: a@b.com\r\nTo: c@d.com\r\nSubject: Directory\r\n"
+                b"X-Unsent: 1\r\nThread-Index: AQAAAA\r\n"
+                b'Content-Type: multipart/mixed; boundary="XX"\r\n\r\n'
+                b"--XX\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n"
+                b"--XX\r\nContent-Type: application/vnd.openxmlformats-"
+                b"officedocument.spreadsheetml.sheet\r\n"
+                b'Content-Disposition: attachment; filename="Office Directory.xlsx"\r\n'
+                b"Content-Transfer-Encoding: base64\r\n\r\n"
+                + base64.b64encode(self.xlsx_bytes()) + b"\r\n"
+                b"--XX\r\nContent-Type: text/csv\r\n"
+                b'Content-Disposition: attachment; filename="Office Directory.csv"\r\n'
+                b"Content-Transfer-Encoding: base64\r\n\r\n"
+                + base64.b64encode(b"name,skype\nJenanira,jen.c\n") + b"\r\n--XX--\r\n")
+
+    def test_the_pane_leads_with_the_headers_a_reader_wants(self):
+        html = review.view("m.eml", self.mail_with_attachment())["html"]
+        # From/To/Subject up top, the transport noise behind a disclosure.
+        self.assertLess(html.index("a@b.com"), html.index("<details"))
+        self.assertLess(html.index("Directory"), html.index("<details"))
+        self.assertGreater(html.index("X-Unsent"), html.index("<details"))
+
+    def test_collapsing_the_pane_does_not_blind_the_diff(self):
+        # The invariant. The pane may hide a header; _doc_text may not, because
+        # metrics() and the PII highlighter both read it.
+        text = review._text_from_eml(self.mail_with_attachment())
+        for header in ("X-Unsent", "Thread-Index", "From", "Subject"):
+            self.assertIn(header, text)
+
+    def test_each_attachment_carries_its_index(self):
+        html = review.view("m.eml", self.mail_with_attachment())["html"]
+        self.assertIn('data-att="0"', html)
+        self.assertIn("Office Directory.xlsx", html)
+
+    def test_an_opened_attachment_yields_text_to_score(self):
+        # Opening an attachment must highlight it like any other pane, so its
+        # contents have to come back as text the PII machinery can read.
+        text = review._attachment_text(self.mail_with_attachment(), 1)
+        self.assertIn("Jenanira", text)
+        self.assertIn("skype", text)
+
+    def test_an_unreadable_attachment_scores_as_empty_not_a_crash(self):
+        # A .jpg has no text. That must be an empty string, not an exception
+        # that takes the whole highlight request down with it.
+        data = (b"From: a@b.com\r\n"
+                b'Content-Type: multipart/mixed; boundary="XX"\r\n\r\n'
+                b"--XX\r\nContent-Type: text/plain\r\n\r\nhi\r\n"
+                b"--XX\r\nContent-Type: image/jpeg\r\n"
+                b'Content-Disposition: attachment; filename="photo.jpg"\r\n'
+                b"\r\nnot-a-jpeg\r\n--XX--\r\n")
+        self.assertEqual(review._attachment_text(data, 0), "")
+
+    def test_ooxml_reads_without_the_c_xml_parser(self):
+        # This machine's python cannot load pyexpat, which took .docx, .xlsx,
+        # .pptx and .xml down with it -- including as mail attachments. The
+        # extractors must not care which parser they got.
+        rows = review._rows_from_xlsx(self.xlsx_bytes())
+        self.assertEqual(rows[0][0], "Jenanira")
+        # And the stand-in parser on its own terms.
+        root = review._XmlShim.fromstring(b'<a xmlns="u"><b r="1">hi</b></a>')
+        self.assertEqual(root.find("{u}b").text, "hi")
+        self.assertEqual(root.find("{u}b").get("r"), "1")
+
+    def test_an_attachment_renders_through_the_normal_viewer(self):
+        # csv rather than the xlsx beside it: reading xlsx needs ElementTree,
+        # and this machine's python has a broken pyexpat, so asserting on it
+        # would test the interpreter instead of this code.
+        name, _, blob = review._attachment_from_eml(self.mail_with_attachment(), 1)
+        self.assertEqual(name, "Office Directory.csv")
+        out = review.view(name, blob)
+        self.assertEqual(out["kind"], "table")
+        self.assertIn("Jenanira", out["html"])
+
+    def test_the_first_attachment_is_index_zero(self):
+        name, _, _ = review._attachment_from_eml(self.mail_with_attachment(), 0)
+        self.assertEqual(name, "Office Directory.xlsx")
+
+    def test_an_attachment_whose_name_lost_its_extension_still_renders(self):
+        # Seen in d1: the rewriter replaced "image001.jpg" wholesale with
+        # "Preeti Arun Agarwal", extension and all. The MIME part still
+        # declares image/jpeg, so the viewer keys off the declared type and
+        # shows it -- while the pane keeps the mangled name, which is the
+        # finding the reviewer has to see.
+        data = (b"From: a@b.com\r\n"
+                b'Content-Type: multipart/mixed; boundary="XX"\r\n\r\n'
+                b"--XX\r\nContent-Type: text/plain\r\n\r\nhi\r\n"
+                b"--XX\r\nContent-Type: image/jpeg\r\n"
+                b'Content-Disposition: attachment; filename="Preeti Arun Agarwal"\r\n'
+                b"\r\nnot-really-a-jpeg\r\n--XX--\r\n")
+        name, ctype, _ = review._attachment_from_eml(data, 0)
+        self.assertEqual(name, "Preeti Arun Agarwal")
+        self.assertEqual(ctype, "image/jpeg")
+        self.assertEqual(review.view_key(name, ctype), "Preeti Arun Agarwal.jpg")
+
+    def test_a_name_that_kept_its_extension_is_left_alone(self):
+        self.assertEqual(review.view_key("report.pdf", "application/pdf"),
+                         "report.pdf")
+
+    def test_asking_for_an_attachment_that_is_not_there_raises(self):
+        with self.assertRaises(IndexError):
+            review._attachment_from_eml(self.mail_with_attachment(), 7)
+
+    # --- inbox polish ----------------------------------------------------
+
+    def test_runs_of_blank_lines_do_not_stretch_the_pane(self):
+        # Outlook mail arrives double-spaced with soft breaks between every
+        # paragraph. Printed literally, one message ran metres of empty pane
+        # and the two sides drifted apart because they padded differently.
+        data = self.eml(b"para one\r\n\r\n\r\n\r\n\r\n\r\npara two\r\n",
+                        From="a@b.com", Content_Type="text/plain")
+        html = review.view("m.eml", data)["html"]
+        self.assertIn("para one", html)
+        self.assertIn("para two", html)
+        self.assertNotIn("\n\n\n", html.replace("\r", ""))
+
+    def test_folding_whitespace_does_not_change_what_the_diff_scores(self):
+        # The pane may reflow. It may not lose a token.
+        data = self.eml(b"call piyush@x.com\r\n\r\n\r\n\r\nnow\r\n",
+                        From="a@b.com", Content_Type="text/plain")
+        import html as _h, re as _re
+        pane = _h.unescape(_re.sub("<[^>]+>", " ", review.view("m.eml", data)["html"]))
+        self.assertEqual(review._tokens(review._text_from_eml(data))
+                         - review._tokens(pane), set())
+
+    def test_a_long_recipient_list_folds_to_one_line(self):
+        cc = ", ".join(f"Person {i} <p{i}@x.com>" for i in range(30))
+        data = self.eml(b"hi", From="a@b.com", To="b@x.com", Cc=cc)
+        html = review.view("m.eml", data)["html"]
+        self.assertIn("p0@x.com", html)          # the first few show
+        self.assertIn("27 more", html)           # the rest fold
+        self.assertIn('data-addr="Cc"', html)    # and fold on BOTH sides
+        self.assertIn("p29@x.com", html)         # still present, just folded
+
+    def test_a_short_recipient_list_is_not_folded(self):
+        data = self.eml(b"hi", From="a@b.com", To="b@x.com", Cc="c@x.com, d@x.com")
+        self.assertNotIn("data-addr", review.view("m.eml", data)["html"])
+
+    def test_every_recipient_still_reaches_the_diff(self):
+        cc = ", ".join(f"Person {i} <p{i}@x.com>" for i in range(30))
+        data = self.eml(b"hi", From="a@b.com", Cc=cc)
+        text = review._text_from_eml(data)
+        for i in (0, 15, 29):
+            self.assertIn(f"p{i}@x.com", text)
+
+    def test_a_zero_byte_attachment_says_so(self):
+        # d1 ships 0 B csv attachments. They rendered as an empty bordered box
+        # that reads as "the viewer failed", which sent a reviewer hunting for
+        # a bug instead of recording that the file shipped empty.
+        data = (b"From: a@b.com\r\n"
+                b'Content-Type: multipart/mixed; boundary="XX"\r\n\r\n'
+                b"--XX\r\nContent-Type: text/plain\r\n\r\nhi\r\n"
+                b"--XX\r\nContent-Type: text/csv\r\n"
+                b'Content-Disposition: attachment; filename="empty.csv"\r\n'
+                b"\r\n\r\n--XX--\r\n")
+        html = review.view("m.eml", data)["html"]
+        self.assertIn("empty.csv", html)
+        self.assertIn("0 B", html)
+        self.assertIn("(empty file)", html)
+
+    def test_body_paragraphs_are_not_double_spaced(self):
+        # Outlook signatures arrive with a blank line between every single
+        # line. Compact means one line break, not two.
+        body = b"line one\r\n\r\nline two\r\n\r\nline three\r\n"
+        data = self.eml(body, From="a@b.com", Content_Type="text/plain")
+        import re as _re
+        pre = _re.search(r"<pre class=body>(.*?)</pre>",
+                         review.view("m.eml", data)["html"], _re.S).group(1)
+        self.assertNotIn("\n\n", pre.replace("\r", ""))
+
+    def test_legacy_xls_says_what_would_read_it(self):
+        # A real .xls is OLE2/BIFF and the standard library cannot read it.
+        # The card must name the one optional package that can, rather than
+        # telling a reviewer to go and re-export a client's delivery.
+        ole = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64
+        out = review.view("report.xls", ole)
+        self.assertEqual(out["kind"], "other")
+        self.assertIn("xlrd", out["why"])
+
+    def nested(self):
+        inner = (b"From: inner@x.com\r\nTo: b@x.com\r\nSubject: Fwd payload\r\n"
+                 b"\r\nreach me at leaked.person@client.co.in\r\n")
+        return (b"From: a@b.com\r\nSubject: see forward\r\n"
+                b'Content-Type: multipart/mixed; boundary="XX"\r\n\r\n'
+                b"--XX\r\nContent-Type: text/plain\r\n\r\nforwarding this\r\n"
+                b"--XX\r\nContent-Type: message/rfc822\r\n\r\n"
+                + inner + b"\r\n--XX--\r\n")
+
+    def test_a_forwarded_email_is_not_a_zero_byte_attachment(self):
+        # message/* parts are CONTAINERS: get_payload(decode=True) returns
+        # None for them, so a forwarded mail listed as "0 B" and opened to a
+        # blank box. A forward is one of the likeliest PII carriers there is.
+        name, ctype, blob = review._attachment_from_eml(self.nested(), 0)
+        self.assertEqual(ctype, "message/rfc822")
+        self.assertIn(b"leaked.person@client.co.in", blob)
+
+    def test_a_forwarded_email_renders_as_an_email(self):
+        name, ctype, blob = review._attachment_from_eml(self.nested(), 0)
+        out = review.view(review.view_key(name, ctype), blob)
+        self.assertEqual(out["kind"], "text")
+        self.assertIn("Fwd payload", out["html"])
+        self.assertIn("leaked.person@client.co.in", out["html"])
+
+    def test_a_forwarded_email_reports_a_real_size(self):
+        html = review.view("m.eml", self.nested())["html"]
+        self.assertNotIn("0 B", html)
+
+    def test_a_whitespace_only_attachment_reads_as_empty(self):
+        # d1 ships 3-byte .txt attachments that are just newlines. They opened
+        # to a blank bordered box that looks like the viewer failed.
+        data = (b"From: a@b.com\r\n"
+                b'Content-Type: multipart/mixed; boundary="XX"\r\n\r\n'
+                b"--XX\r\nContent-Type: text/plain\r\n\r\nhi\r\n"
+                b"--XX\r\nContent-Type: text/plain\r\n"
+                b'Content-Disposition: attachment; filename="ATT00012.txt"\r\n'
+                b"\r\n\r\n\r\n\r\n--XX--\r\n")
+        name, ctype, blob = review._attachment_from_eml(data, 0)
+        self.assertEqual(review.view(review.view_key(name, ctype), blob)["kind"],
+                         "empty")
+
+    def test_lead_headers_read_in_inbox_order(self):
+        # Wire order is whatever the sender's client emitted -- d1 mail comes
+        # out From, Date, Subject, To, Cc. A reader expects From/To/Cc then
+        # Subject then Date, the way every mail client shows it.
+        data = self.eml(b"hi", Date="Mon, 1 Jan 2024 00:00:00 +0000",
+                        From="a@b.com", Subject="S", To="t@b.com", Cc="c@b.com")
+        html = review.view("m.eml", data)["html"]
+        order = [html.index(f">{h}<") for h in ("From", "To", "Cc", "Subject", "Date")]
+        self.assertEqual(order, sorted(order))
+
+    def test_a_broken_eml_still_shows_its_bytes(self):
+        out = review.view("m.eml", b"not a mail at all, just a line")
+        self.assertEqual(out["kind"], "text")
+        self.assertIn("not a mail at all", out["html"])
+
+
+class Searching(unittest.TestCase):
+    """A path search that only does substrings makes you type the path."""
+
+    ROWS = [
+        {"id": 0, "label": "gmail/ana@x.com/drafts/15b1.eml", "left": "a", "right": "b"},
+        {"id": 1, "label": "gmail/ana@x.com/messages/99ff.eml", "left": "a", "right": "b"},
+        {"id": 2, "label": "dropbox/bob@x.com/files/report.pdf", "left": "a", "right": "b"},
+        {"id": 3, "label": "gmail/bob@x.com/drafts/15b1.eml", "left": "a", "right": "b"},
+    ]
+
+    def test_every_term_has_to_match(self):
+        hit = review.search_rows(self.ROWS, "gmail drafts")
+        self.assertEqual([r["id"] for r in hit], [0, 3])
+
+    def test_terms_may_come_in_any_order(self):
+        self.assertEqual([r["id"] for r in review.search_rows(self.ROWS, "drafts gmail")],
+                         [r["id"] for r in review.search_rows(self.ROWS, "gmail drafts")])
+
+    def test_a_filename_beats_a_folder_deeper_in_the_path(self):
+        # Typing a reported filename should put it first, not behind every
+        # other pair that happens to contain the string somewhere.
+        hit = review.search_rows(self.ROWS, "15b1")
+        self.assertEqual(hit[0]["label"].rsplit("/", 1)[1], "15b1.eml")
+
+    def test_an_exact_basename_outranks_a_partial_one(self):
+        rows = [{"id": 0, "label": "a/report-final.pdf", "left": "", "right": ""},
+                {"id": 1, "label": "a/report.pdf", "left": "", "right": ""}]
+        self.assertEqual(review.search_rows(rows, "report.pdf")[0]["id"], 1)
+
+    def test_an_empty_query_matches_nothing(self):
+        self.assertEqual(review.search_rows(self.ROWS, "   "), [])
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

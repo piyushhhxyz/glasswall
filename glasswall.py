@@ -75,8 +75,16 @@ def _tokens(text: str) -> set[str]:
 
 def _doc_text(side: str, sid: str, key: str, store) -> str:
     data = store.cached_read(key)
-    if key.lower().endswith(".pdf") and RENDER.available:
+    low = key.lower()
+    if low.endswith(".pdf") and RENDER.available:
         return RENDER.text(f"{side}:{sid}", data)
+    # Must match what view() puts on screen. If the pane decodes the mail and
+    # the diff does not, the reviewer reads an address the metrics never saw.
+    if low.endswith(".eml"):
+        try:
+            return _text_from_eml(data)
+        except Exception:  # noqa: BLE001
+            pass
     return data.decode("utf-8", "replace")
 
 
@@ -259,6 +267,128 @@ def _jhtml(obj, indent: int = 0, out=None) -> list:
     return out
 
 
+# --- XML without pyexpat ----------------------------------------------------
+# ElementTree is a thin wrapper over the C expat library, and a python whose
+# pyexpat will not load takes every OOXML format down with it -- on this
+# machine `import pyexpat` raises and .docx/.xlsx/.pptx/.xml ALL landed on the
+# "cannot show this" card, including as mail attachments. A viewer is not
+# worth much if a broken interpreter build can switch it off, so when the C
+# parser is missing we build the same tiny tree over html.parser, which is
+# pure python and always there. Only the handful of ElementTree calls these
+# extractors actually make are implemented; this is not a general XML parser.
+
+
+class _XElem:
+    """Enough of an ElementTree Element for the extractors below."""
+
+    __slots__ = ("tag", "text", "attrib", "_kids")
+
+    def __init__(self, tag: str, attrib=None):
+        self.tag, self.text, self.attrib, self._kids = tag, None, attrib or {}, []
+
+    def __iter__(self):
+        return iter(self._kids)
+
+    def iter(self, tag=None):
+        if tag is None or self.tag == tag:
+            yield self
+        for k in self._kids:
+            yield from k.iter(tag)
+
+    def findall(self, tag):
+        return [k for k in self._kids if k.tag == tag]
+
+    def find(self, tag):
+        return next((k for k in self._kids if k.tag == tag), None)
+
+    def get(self, key, default=None):
+        return self.attrib.get(key, default)
+
+
+class _XParseError(Exception):
+    pass
+
+
+def _xml_fromstring(raw):
+    """Parse OOXML into _XElem, resolving xmlns prefixes to {uri}local names.
+
+    html.parser lowercases names, which is safe here only because every tag
+    these extractors ask for is already lowercase (w:t, a:p, row, c, v, si).
+    """
+    from html.parser import HTMLParser
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf8", "replace")
+
+    class P(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.root = None
+            self.stack = []
+            self.ns = [{}]
+
+        def _name(self, tag, attrs):
+            declared = {k.split(":", 1)[1] if ":" in k else "": v
+                        for k, v in attrs.items() if k == "xmlns" or k.startswith("xmlns:")}
+            scope = dict(self.ns[-1], **declared) if declared else self.ns[-1]
+            prefix, _, local = tag.rpartition(":")
+            uri = scope.get(prefix or "")
+            return (f"{{{uri}}}{local}" if uri else local), scope
+
+        def _open(self, tag, attrs):
+            a = dict(attrs)
+            name, scope = self._name(tag, a)
+            el = _XElem(name, a)
+            if self.stack:
+                self.stack[-1]._kids.append(el)
+            elif self.root is None:
+                self.root = el
+            return el, scope
+
+        def handle_starttag(self, tag, attrs):
+            el, scope = self._open(tag, attrs)
+            self.stack.append(el)
+            self.ns.append(scope)
+
+        def handle_startendtag(self, tag, attrs):
+            self._open(tag, attrs)
+
+        def handle_endtag(self, tag):
+            if self.stack:
+                self.stack.pop()
+                self.ns.pop()
+
+        def handle_data(self, data):
+            if self.stack:
+                top = self.stack[-1]
+                top.text = (top.text or "") + data
+
+    try:
+        p = P()
+        p.feed(raw)
+        p.close()
+    except Exception as exc:  # noqa: BLE001
+        raise _XParseError(str(exc)) from exc
+    if p.root is None:
+        raise _XParseError("no root element")
+    return p.root
+
+
+class _XmlShim:
+    ParseError = _XParseError
+    fromstring = staticmethod(_xml_fromstring)
+
+
+def _ET():
+    """ElementTree if its parser loads, else the pure-python stand-in."""
+    try:
+        ET = _ET()
+        ET.fromstring("<a/>")
+        return ET
+    except Exception:  # noqa: BLE001 -- a missing pyexpat raises ImportError
+        return _XmlShim
+
+
 def _json_html(data: bytes) -> str:
     import json as _json
     text = data.decode("utf8", "replace")
@@ -362,7 +492,7 @@ def _text_from_docx(data: bytes) -> str:
     is the only way the two panes stay comparable line for line.
     """
     import zipfile
-    import xml.etree.ElementTree as ET
+    ET = _ET()
 
     W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
     with zipfile.ZipFile(io.BytesIO(data)) as z:
@@ -417,7 +547,7 @@ def _text_from_pptx(data: bytes) -> str:
     a reviewer writes in a comment.
     """
     import zipfile
-    import xml.etree.ElementTree as ET
+    ET = _ET()
 
     A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
     with zipfile.ZipFile(io.BytesIO(data)) as z:
@@ -446,6 +576,302 @@ def _text_from_pptx(data: bytes) -> str:
     return "\n".join(out).strip()
 
 
+def _html_to_text(html: str) -> str:
+    """Tags out, line structure kept. Good enough to read and to diff."""
+    import html as _html
+    html = re.sub(r"(?is)<(script|style)\b.*?</\1\s*>", " ", html)
+    html = re.sub(r"(?i)<(?:br|/p|/div|/tr|/li|/h[1-6])\b[^>]*>", "\n", html)
+    html = re.sub(r"(?s)<[^>]*>", " ", html)
+    html = _html.unescape(html)
+    html = re.sub(r"[ \t]+", " ", html)
+    return re.sub(r"\n{3,}", "\n\n", html).strip()
+
+
+#: Shown before the fold, in this order. Everything else is still rendered --
+#: just behind a disclosure, because twenty Received hops above the message is
+#: how you get a reviewer who never scrolls to the message.
+_EML_LEAD = ("From", "To", "Cc", "Bcc", "Reply-To", "Subject", "Date")
+
+
+def _eml_parse(data: bytes):
+    """(headers, body_text, attachments) of an exported mail.
+
+    One parse feeding three consumers -- the pane, the diff and the attachment
+    route -- so none of them can disagree about what the mail contains.
+    """
+    import email
+    import email.policy
+
+    msg = email.message_from_bytes(data, policy=email.policy.default)
+
+    headers: list[tuple[str, str]] = []
+    for name, value in msg.items():
+        try:
+            text = str(value).strip()
+        except Exception:  # noqa: BLE001 -- a header that will not decode is
+            # still evidence; keep it as it arrived rather than losing it.
+            text = str(msg.get_raw(name) if hasattr(msg, "get_raw") else "")
+        headers.append((name, text))
+    if not headers:
+        raise ValueError("not a mail")
+
+    try:
+        body = msg.get_body(preferencelist=("plain", "html"))
+    except Exception:  # noqa: BLE001
+        body = None
+    text = ""
+    if body is not None:
+        try:
+            text = body.get_content()
+        except Exception:  # noqa: BLE001 -- a part that will not decode must
+            # not cost the headers and the attachment list as well.
+            payload = body.get_payload(decode=True)
+            text = payload.decode("utf8", "replace") if payload else ""
+        if body.get_content_type() == "text/html":
+            text = _html_to_text(text)
+
+    try:
+        parts = list(msg.iter_attachments())
+    except Exception:  # noqa: BLE001
+        parts = []
+    attachments = []
+    for n, part in enumerate(parts):
+        payload = _part_bytes(part)
+        attachments.append({"n": n, "name": part.get_filename() or f"part-{n}",
+                            "type": part.get_content_type(), "size": len(payload)})
+    return headers, text.strip(), attachments
+
+
+def _part_bytes(part) -> bytes:
+    """The bytes of one MIME part, including the parts that carry no payload.
+
+    ``get_payload(decode=True)`` returns None for a message/* part, because it
+    is a CONTAINER rather than an encoded blob. Reading that as an empty
+    payload is how a forwarded mail -- one of the likeliest PII carriers in a
+    mailbox -- came out listed as "0 B" and opened to a blank box.
+    """
+    if part.get_content_maintype() == "message":
+        try:
+            inner = part.get_payload()
+            if isinstance(inner, list):
+                inner = inner[0]
+            return inner.as_bytes()
+        except Exception:  # noqa: BLE001
+            pass
+    return part.get_payload(decode=True) or b""
+
+
+def _attachment_from_eml(data: bytes, n: int) -> tuple[str, bytes]:
+    """Attachment n of a mail, as (filename, bytes), for the normal viewer.
+
+    Addressed by POSITION rather than name on purpose: the rewriter renames
+    attachments -- d1 turns "Terancekry Office Directory.xlsx" into "Abhishek
+    Madhuri Pandey Office Directory.xlsx" -- so a name is exactly the thing
+    that does not survive to identify the same file on the other side.
+    """
+    import email
+    import email.policy
+
+    msg = email.message_from_bytes(data, policy=email.policy.default)
+    parts = list(msg.iter_attachments())
+    if not 0 <= n < len(parts):
+        raise IndexError(f"attachment {n} of {len(parts)}")
+    part = parts[n]
+    return (part.get_filename() or f"part-{n}",
+            part.get_content_type(),
+            _part_bytes(part))
+
+
+def view_key(name: str, ctype: str) -> str:
+    """The name to hand view(), when the real name may have lost its type.
+
+    d1 rewrote "image001.jpg" to "Preeti Arun Agarwal" -- extension included --
+    so keying the viewer off the filename alone left a readable JPEG on the
+    "no viewer for this file type" card. The MIME part still declares what it
+    is, so fall back to that. The DISPLAYED name is left mangled on purpose:
+    it is the finding.
+    """
+    # A message/* part is a whole mail. Routing it to the .eml viewer is what
+    # makes a forward readable -- headers, body and its own attachments --
+    # instead of a blob named ATT00001.
+    if (ctype or "").startswith("message/"):
+        return name if name.lower().endswith(".eml") else name + ".eml"
+    if Path(name).suffix:
+        return name
+    return name + (mimetypes.guess_extension(ctype or "") or "")
+
+
+def _attachment_text(data: bytes, n: int) -> str:
+    """The text of attachment n, exactly as the pane shows it.
+
+    Taken from the rendered HTML rather than re-extracted, so the highlights
+    can only ever land on something the reviewer is actually looking at. An
+    attachment with no text -- a photo, a binary the viewer declined -- scores
+    as empty rather than raising, because one unreadable attachment must not
+    cost the document its highlights.
+    """
+    try:
+        name, ctype, blob = _attachment_from_eml(data, n)
+        shape = view(view_key(name, ctype), blob)
+    except Exception:  # noqa: BLE001
+        return ""
+    if shape.get("kind") not in ("text", "table", "records"):
+        return ""
+    return _html_to_text(shape.get("html") or "")
+
+
+def _text_from_eml(data: bytes) -> str:
+    """The mail as flat text: EVERY header, the decoded body, attachment names.
+
+    A .eml off Gmail or Outlook is RFC 5322 on the wire, and almost none of it
+    is the plain text the extension list implied: the subject arrives as an
+    RFC 2047 encoded-word, the text part as quoted-printable, the HTML part
+    and every attachment as base64. Handing those bytes to the tokeniser cost
+    the review its teeth -- an address the rewriter missed inside a base64
+    part is one unbroken token on both sides, and ``piyush@x.com`` left in a
+    quoted-printable part reads ``piyush=40x=2Ecom``, matching nothing. Either
+    way the pair showed no removed tokens and passed clean.
+
+    This is what metrics() and the PII highlighter read, so it stays complete
+    even where the pane folds things away. The pane may hide a header. This
+    may not.
+    """
+    headers, body, attachments = _eml_parse(data)
+    out = [f"{name}: {value}" for name, value in headers]
+    out += ["", body or "(no body)"]
+    if attachments:
+        out.append("")
+        out.append(f"--- {len(attachments)} attachment"
+                   f"{'s' * (len(attachments) != 1)} ---")
+        out += [f"  {a['name']} ({a['type']}, {_size(a['size'])})"
+                for a in attachments]
+    return "\n".join(out).strip()
+
+
+#: Recipients shown before the fold. Three is enough to know who a mail is
+#: to; the 35-address Cc lists in this corpus pushed the message itself off
+#: the screen entirely.
+_ADDR_LEAD = 3
+_ADDR_HEADERS = {"To", "Cc", "Bcc"}
+
+
+def _fold_addresses(name: str, value: str) -> str:
+    """One address header as HTML, long lists folded behind a disclosure.
+
+    Split with getaddresses rather than on commas: a display name may contain
+    one ("Sharma, Thalirola"), and splitting there invents recipients.
+    """
+    import email.utils
+    import html as _html
+
+    pairs = [a for a in email.utils.getaddresses([value]) if any(a)]
+    if len(pairs) <= _ADDR_LEAD:
+        return _html.escape(value)
+    show, rest = pairs[:_ADDR_LEAD], pairs[_ADDR_LEAD:]
+    fmt = lambda p: _html.escape(f"{p[0]} <{p[1]}>" if p[0] else p[1])  # noqa: E731
+    head = ", ".join(fmt(p) for p in show)
+    tail = ", ".join(fmt(p) for p in rest)
+    return (f"{head}, <details class=addr data-addr=\"{_html.escape(name)}\">"
+            f"<summary>{len(rest)} more</summary>{tail}</details>")
+
+
+def _eml_html(data: bytes) -> str:
+    """The same mail, shaped like an inbox.
+
+    Identical content to _text_from_eml, folded rather than filtered: lead
+    headers first, the rest behind a disclosure, the message, the attachments.
+    Folding is presentation only -- see _text_from_eml. Every fold carries a
+    data- attribute so the twin fold on the other side opens with it; opening
+    one pane alone would push it down and leave the synced scroll comparing
+    two different lines.
+    """
+    import html as _html
+
+    headers, body, attachments = _eml_parse(data)
+    # Sorted into _EML_LEAD order, not wire order: senders emit these in any
+    # order at all (d1 mail arrives From, Date, Subject, To, Cc) and a reader
+    # expects the shape every mail client uses.
+    lead = sorted(((n, v) for n, v in headers if n.title() in _EML_LEAD),
+                  key=lambda nv: _EML_LEAD.index(nv[0].title()))
+    rest = [(n, v) for n, v in headers if n.title() not in _EML_LEAD]
+
+    def row(name, value, fold_addresses=False):
+        if fold_addresses and name.title() in _ADDR_HEADERS:
+            shown = _fold_addresses(name, value)
+        else:
+            shown = _html.escape(value)
+        return f"<dt>{_html.escape(name)}</dt><dd>{shown or '&mdash;'}</dd>"
+
+    out = ["<div class=eml>", "<dl class=hdr>"]
+    for name, value in (lead or headers[:1]):
+        out.append(row(name, value, fold_addresses=True))
+    out.append("</dl>")
+    if rest:
+        # <details> rather than a script: one element, it prints, and it
+        # survives the panes being rebuilt on every navigation.
+        out.append(f"<details class=more data-eml=hdr><summary>{len(rest)} "
+                   f"more header{'s' * (len(rest) != 1)}</summary><dl class=hdr>")
+        for name, value in rest:
+            out.append(row(name, value))
+        out.append("</dl></details>")
+
+    # Outlook sends a blank line between every line. Printed literally, one
+    # message ran metres of empty pane -- and the two sides padded DIFFERENTLY,
+    # so the synced scroll drifted the further down you read.
+    shown_body = re.sub(r"\n\s*\n+", "\n", (body or "").replace("\r\n", "\n"))
+    out.append(f"<pre class=body>{_html.escape(shown_body) or '(no body)'}</pre>")
+
+    if attachments:
+        out.append(f"<div class=atts><b>{len(attachments)} attachment"
+                   f"{'s' * (len(attachments) != 1)}</b>")
+        for a in attachments:
+            out.append(
+                f"<details class=att data-att=\"{a['n']}\"><summary>"
+                f"<span class=an>{_html.escape(a['name'])}</span> "
+                f"<span class=am>{_html.escape(a['type'])} &middot; "
+                f"{_size(a['size'])}</span></summary>"
+                + (f"<div class=abody>(empty file)</div></details>" if not a["size"]
+                   else f"<div class=abody data-n=\"{a['n']}\">&hellip;</div></details>"))
+        out.append("</div>")
+    out.append("</div>")
+    return "".join(out)
+
+
+def _size(n: int) -> str:
+    for unit in ("B", "KB", "MB"):
+        if n < 1024 or unit == "MB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.0f} B"
+
+
+#: Legacy binary Excel. Separate from _SHEET_EXTS because these need the
+#: optional reader, not the zip-of-XML one.
+_OLD_SHEET_EXTS = {".xls", ".xlt"}
+
+
+def _rows_from_xls(data: bytes):
+    """Rows of a legacy binary .xls, or None when nothing here can read it.
+
+    Returning None rather than raising keeps this a soft capability: the
+    viewer falls through to a card that names the package, and the tool still
+    runs on an interpreter with nothing installed.
+    """
+    try:
+        import xlrd
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        book = xlrd.open_workbook(file_contents=data)
+        sheet = book.sheet_by_index(0)
+    except Exception:  # noqa: BLE001 -- a corrupt workbook is the card's job
+        return None
+    rows = []
+    for r in range(min(sheet.nrows, _MAX_ROWS)):
+        rows.append(["" if c is None else str(c) for c in sheet.row_values(r)])
+    return rows
+
+
 def _rows_from_xlsx(data: bytes):
     """First sheet of an xlsx, using only the standard library.
 
@@ -456,7 +882,7 @@ def _rows_from_xlsx(data: bytes):
     raw byte route, and the browser SAVED each one instead of showing it.
     """
     import zipfile
-    import xml.etree.ElementTree as ET
+    ET = _ET()
 
     NS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
     with zipfile.ZipFile(io.BytesIO(data)) as z:
@@ -525,6 +951,12 @@ def view(key: str, data: bytes) -> dict:
     """
     import html as _html
     ext = Path(key).suffix.lower()
+    # Nothing in it. d1 ships 0 B csvs and 3-byte .txt attachments that are
+    # just newlines; both drew an empty bordered box that reads as "the viewer
+    # failed" and sent reviewers hunting for a bug instead of recording that
+    # the pipeline shipped an empty file.
+    if not data.strip():
+        return {"kind": "empty", "why": f"empty file ({_size(len(data))})"}
     if ext == ".pdf":
         return {"kind": "pdf"}
     try:
@@ -532,6 +964,16 @@ def view(key: str, data: bytes) -> dict:
             return {"kind": "table", "html": _table_html(_rows_from_csv(data))}
         if ext in _SHEET_EXTS:
             return {"kind": "table", "html": _table_html(_rows_from_xlsx(data))}
+        if ext in _OLD_SHEET_EXTS:
+            # A real .xls is OLE2/BIFF -- no standard-library reader exists,
+            # and writing one is a container format plus a record format plus
+            # a shared-string table. Optional rather than required, because
+            # everything else here runs on a bare interpreter; when the
+            # package is absent the card below names it instead of telling a
+            # reviewer to re-export a client's delivery, which they cannot do.
+            rows = _rows_from_xls(data)
+            if rows is not None:
+                return {"kind": "table", "html": _table_html(rows)}
         if ext in _WORD_EXTS:
             return {"kind": "text",
                     "html": f"<pre>{_html.escape(_text_from_docx(data))}</pre>"}
@@ -560,6 +1002,13 @@ def view(key: str, data: bytes) -> dict:
         if ext in _JSON_EXTS | _JSONL_EXTS | _XML_EXTS:
             return {"kind": "text",
                     "html": f"<pre>{_html.escape(data.decode('utf8', 'replace'))}</pre>"}
+        if ext == ".eml":
+            try:
+                return {"kind": "text", "html": _eml_html(data)}
+            except Exception:  # noqa: BLE001 -- see the JSON note above: a mail
+                # that will not parse is still a file the reviewer must look
+                # at, so it drops to the raw bytes rather than to a card.
+                pass
         if ext in _TEXT_EXTS:
             return {"kind": "text",
                     "html": f"<pre>{_html.escape(data.decode('utf8', 'replace'))}</pre>"}
@@ -579,7 +1028,8 @@ def view(key: str, data: bytes) -> dict:
 #: old behaviour, which was to hand the bytes to the browser and hope.
 _CANNOT = {
     ".doc": "legacy binary Word — re-export as .docx to review it here",
-    ".xls": "legacy binary Excel — re-export as .xlsx to review it here",
+    ".xls": "legacy binary Excel (OLE2/BIFF) — no standard-library reader. "
+            "Install the optional package to view it here: pip install xlrd",
     ".ppt": "legacy binary PowerPoint — re-export as .pptx to review it here",
 }
 
@@ -1020,6 +1470,50 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   white-space:pre-wrap;word-break:normal;overflow-wrap:break-word}
 .doc .more{color:#888;font-size:12px;padding:6px 2px}
 
+/* An exported mail, shaped like an inbox. Deliberately plain: this sits
+   beside a second copy of itself and anything decorative doubles as noise.
+   Both panes must stay the SAME height row for row or the synced scroll
+   drifts, which is why a disclosure opened on one side opens on the other. */
+.doc .eml dl.hdr{display:grid;grid-template-columns:max-content 1fr;
+  gap:0 12px;margin:0 0 4px 0;font-size:12.5px;line-height:1.35}
+.doc .eml dl.hdr dt{color:#888;font-weight:400;white-space:nowrap}
+.doc .eml dl.hdr dd{margin:0;word-break:break-word}
+.doc .eml details.more{margin:0 0 8px 0}
+.doc .eml details.more summary,.doc .eml details.att summary{
+  cursor:pointer;color:#1a4f8a;font-size:12px;padding:2px 0;list-style:revert}
+.doc .eml details.more dl.hdr{margin:6px 0 0 0;color:#555}
+/* The message, set apart from the envelope. Same pane, different weight:
+   headers are grey metadata at 12.5px, the message is what you read. Without
+   the rule and the shift they ran together and a reviewer scrolled past the
+   first line of the mail looking for where the headers stopped. */
+.doc .eml pre.body{border-top:1px solid var(--line,#e3e6ea);
+  margin:10px 0 0 0;padding:12px 0 0 0;font-size:13px;line-height:1.45;
+  color:#1a1a1a}
+.doc .eml dl.hdr{font-size:12px}
+/* Wordmark. Quiet on purpose -- this sits above a document all day. */
+.wm{font-weight:600;letter-spacing:-.01em;color:#7a8290}
+.wm.hdr{font-size:12px;padding:0 10px 0 2px;border-right:1px solid var(--line,#e3e6ea);
+  margin-right:8px;white-space:nowrap}
+h1 .wm{color:#9aa0a6;font-weight:600;margin-right:6px}
+.skelname{position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);
+  color:#c3c8cf;font-size:12px;letter-spacing:.06em;text-transform:lowercase;
+  pointer-events:none}
+
+.doc .eml dl.hdr dt{font-size:11.5px;letter-spacing:.02em}
+.doc .eml .atts{border-top:1px solid var(--line,#e3e6ea);margin-top:14px;
+  padding-top:8px;font-size:12.5px}
+.doc .eml .abody img{display:block}
+.doc .eml .atts .why{color:#9aa0a6;font-size:11.5px;margin-left:8px}
+.doc .eml details.addr{display:inline}
+.doc .eml details.addr summary{display:inline;cursor:pointer;color:#1a4f8a}
+.doc .eml details.addr[open] summary{display:block}
+.doc .eml details.att{margin:4px 0 0 0}
+.doc .eml details.att .an{word-break:break-word}
+.doc .eml details.att .am{color:#9aa0a6}
+.doc .eml .abody{margin:6px 0 10px 0;border:1px solid #e3e6ea;border-radius:4px;
+  padding:6px;max-height:420px;overflow:auto;background:#fcfcfd}
+.doc .eml .abody table{font-size:12px}
+
 /* Formatted JSON. Keys carry the colour because a reviewer scanning for a
    leak is scanning field names first -- emailAddress, displayName, phone --
    and only then reading the value beside it. */
@@ -1286,7 +1780,7 @@ mark.pii.leak{background:#fbd5d0;box-shadow:inset 0 -1px 0 #d99086}
 /* Loading state. Without it the PREVIOUS document stays on screen while the
    next one is fetched, so pressing Enter looks like nothing happened -- the
    reviewer cannot tell a slow load from a repeated file. */
-.shim{flex:1;overflow:hidden;background:#eef0f2;padding:14px 16px}
+.shim{flex:1;overflow:hidden;background:#eef0f2;padding:14px 16px;position:relative}
 .shim i{display:block;height:11px;border-radius:5px;margin:0 0 9px;
   background:linear-gradient(90deg,#e3e6ea 25%,#f2f4f6 37%,#e3e6ea 63%);
   background-size:400% 100%;animation:sh 1.1s ease-in-out infinite}
@@ -1316,7 +1810,7 @@ kbd{font:11px ui-monospace,Menlo,monospace;background:var(--soft);border:1px sol
 </style></head><body>
 
 <div id="veil" class="on"><div class="pop">
-  <h1>Compare a run</h1>
+  <h1><span class="wm">glasswall</span> Compare a run</h1>
   <p class="sub">Point at the folder, zip or bucket holding it. Both halves are found inside.</p>
   <div class="row"><label for="label">Name <span class="opt">optional</span></label>
     <div class="grow"><input type="text" id="label" spellcheck="false"
@@ -1344,6 +1838,7 @@ kbd{font:11px ui-monospace,Menlo,monospace;background:var(--soft);border:1px sol
 <div id="banner"><span id="btext"></span><button id="bfix"></button><span class="x" id="bx">&times;</span></div>
 <header>
   <button class="icobtn" id="showside" title="show the list  (s)" style="display:none">&#187;</button>
+  <span class="wm hdr" title="glasswall">glasswall</span>
   <span class="loc" id="loc" title=""></span>
   <span class="pos" id="pos">–</span>
   <span class="name" id="name"></span>
@@ -1533,7 +2028,14 @@ let EXTRA=[], SMORE=0, SSEQ=0, SQ=null, TOTAL=0;
 function pool(){return q()? ALL.concat(EXTRA) : ALL;}
 const entOf=p=>p.label.split("/")[0];
 function q(){return el("q").value.trim().toLowerCase();}
-function matches(p){const s=q(); return !s || p.label.toLowerCase().includes(s);}
+/* Same rule as the server's search_rows: every term, any order. The local
+   filter used ONE substring while the server used terms, so a two-word query
+   emptied the tree and then refilled it when the fetch came back. */
+function matches(p){
+  const s=q(); if(!s) return true;
+  const hay=p.label.toLowerCase();
+  return s.split(/\s+/).every(t=>!t||hay.includes(t));
+}
 //: The visible tree, flattened to rows: a folder, then its contents if it is
 //: open, then the next folder. Depth drives the indent.
 function treeRows(){
@@ -1673,6 +2175,8 @@ async function search(){
   SMORE=Math.max(0,(r.matched||0)-(r.rows||[]).length);
   snote(r);
   build(); list(); render();
+  // The top hit is what gets opened next, nearly every time.
+  warmTop();
 }
 
 function stepFolder(d){
@@ -1718,6 +2222,11 @@ function build_pane(box,side,id,meta){
     const sc=document.createElement("div"); sc.className="scroll";
     const img=new Image(); img.src="/doc/"+side+"/"+id; img.style.width="100%";
     sc.appendChild(img); box.appendChild(sc); return sc;
+  }
+  if(meta.kind==="empty"){
+    box.innerHTML="<div class='empty'><b>This file is empty.</b><br>"+
+      "<span class=why>"+esc(meta.why||"")+"</span></div>";
+    return null;
   }
   if(meta.kind==="other"){
     // Never an iframe. Chrome does not "fail to render" a .doc or a broken
@@ -1793,7 +2302,7 @@ function step_page(d){
 //: "ready" is what made the shimmer skip while the old pane was still up.
 //: Small on purpose -- prefetch only ever reaches i-1..i+2, and each entry
 //: retains a whole rendered document.
-const DOCC=new Map(), DOCMAX=8;
+const DOCC=new Map(), DOCMAX=20;
 function dkey(side,id){return side+"/"+id;}
 function docFetch(side,id){
   const k=dkey(side,id);
@@ -1811,16 +2320,37 @@ function docFetch(side,id){
 /* Fetch what the reviewer is about to ask for. j/Enter walks forward, so the
    next two are the high-value guesses; the previous one covers a k. Fired on
    idle so it never competes with painting the document actually on screen. */
+/* Warm one pair, both sides. */
+function warm(p){
+  if(!p) return;
+  docFetch("left",p.id).catch(()=>{});
+  if(p.right&&!SOLO) docFetch("right",p.id).catch(()=>{});
+}
 function prefetch(){
   // Reads i when it RUNS, not when it was scheduled: an idle callback that
   // fires after two more j presses would otherwise warm the neighbours of a
-  // document already left behind. One document ahead only -- server-side
-  // rendering is serialised behind a single lock, so a wider window queues
-  // ahead of the document actually on screen and makes the wait longer.
-  const run=()=>{const p=VIEW[i+1]; if(!p)return;
-    docFetch("left",p.id).catch(()=>{});
-    if(p.right&&!SOLO) docFetch("right",p.id).catch(()=>{});};
+  // document already left behind.
+  //
+  // The window used to be ONE ahead, because PDF rendering is serialised
+  // server-side and a wider window queued ahead of the document on screen.
+  // That cost is only paid when PyMuPDF is actually rendering pages; on a
+  // mailbox every read is an independent S3 round trip on a threaded server,
+  // and one-ahead meant every j press waited a full trip. Staged so the next
+  // document still goes first and nothing queues in front of it.
+  const run=()=>{
+    warm(VIEW[i+1]);
+    (window.requestIdleCallback||(f=>setTimeout(f,200)))(()=>{
+      warm(VIEW[i+2]); warm(VIEW[i-1]);
+    });
+  };
   (window.requestIdleCallback||(f=>setTimeout(f,120)))(run);
+}
+/* After a search the reviewer almost always opens the top hit. Warming the
+   first few turns that first open from a round trip into a cache hit. */
+function warmTop(){
+  (window.requestIdleCallback||(f=>setTimeout(f,200)))(()=>{
+    for(let k=0;k<3;k++) warm(VIEW[k]);
+  });
 }
 /* Highlighting. A redaction is obvious -- the value is gone. A REPLACEMENT is
    not: "makhubocalvin@gmail.com" became "zoravinadorncombe@gmail.com" and
@@ -1883,6 +2413,17 @@ function mark(root,side){
   }
   paint(root, side==="left" ? PIIRX.orig : PIIRX.repl, side);
 }
+/* mark(), but against ONE subtree's own vocabulary rather than the document's.
+   An opened attachment is scored from its own two sides -- the mail's marks
+   would not contain a name that appears only inside the spreadsheet, which is
+   exactly the leak worth catching. */
+function markWith(root,side,px){
+  if(!root||!HILITE||!px) return;
+  const rx={orig:rxOf(px.orig),repl:rxOf(px.repl),leak:rxOf(px.leak)};
+  paint(root, rx.leak, "leak");
+  if(SOLO){ paint(root, rx.repl, "right"); paint(root, rx.orig, "left"); return; }
+  paint(root, side==="left" ? rx.orig : rx.repl, side);
+}
 function paint(root,rx,cls){
   if(!root||!rx) return;
   const w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{
@@ -1924,7 +2465,10 @@ function paint(root,rx,cls){
   });
 }
 function shimmer(box){
-  box.innerHTML="<div class='shim'><b></b>"+"<i></i>".repeat(14)+"</div>";
+  // A bare grey skeleton reads as a hang. Naming the tool and the wait makes
+  // the same second of latency legible instead of worrying.
+  box.innerHTML="<div class='shim'><b></b>"+"<i></i>".repeat(14)+
+    "<div class=skelname>glasswall</div></div>";
 }
 async function panes(p){
   const seq=++SEQ; LS=RS=null; PAGE=1;
@@ -1965,8 +2509,82 @@ async function panes(p){
         "Either the run withheld it, or it was never processed.</div>";
   mark(LS,"left"); if(RS) mark(RS,"right");
   if(lm.kind==="records"&&rm.kind==="records") alignRecords(LS,RS);
+  linkEml(LS,RS,p.id);
   linkScroll(LS,RS);
   prefetch();
+}
+
+/* A mail's disclosures, kept in step across the two panes.
+
+   Opening "18 more headers" on one side only would push that pane down by
+   eighteen rows and leave the synced scroll comparing line 40 against line
+   22 -- the panes would still scroll together, just wrongly. So a toggle is
+   mirrored to the same disclosure on the other side, matched on data-eml /
+   data-att rather than on the attachment NAME, which the rewriter changes.
+
+   An attachment's body is fetched the first time it is opened, never on
+   load: a thread with a 40 MB deck attached would otherwise pay for it on
+   every navigation, and Piyush asked for open-on-demand. */
+function linkEml(ls,rs,id){
+  if(!ls&&!rs) return;
+  const sides=[[ls,"left"],[rs,"right"]].filter(x=>x[0]);
+  const twin=(box,sel)=>sides.map(x=>x[0]).filter(b=>b!==box)
+                            .map(b=>b.querySelector(sel))[0];
+  sides.forEach(([box,side])=>{
+    box.querySelectorAll("details[data-eml],details[data-att],details[data-addr]")
+       .forEach(d=>{
+      d.addEventListener("toggle",()=>{
+        const att=d.getAttribute("data-att"), addr=d.getAttribute("data-addr");
+        const sel=addr!==null?'details[data-addr="'+addr+'"]'
+                 :att===null?"details[data-eml=hdr]"
+                            :'details[data-att="'+att+'"]';
+        const t=twin(box,sel);
+        if(t&&t.open!==d.open) t.open=d.open;
+        if(!d.open||att===null) return;
+        const body=d.querySelector(".abody");
+        if(!body||body.dataset.done) return;
+        body.dataset.done="1"; body.textContent="loading\u2026";
+        fetch("/api/attach/"+side+"/"+id+"/"+att).then(r=>r.json()).then(m=>{
+          if(m.kind==="table"||m.kind==="text"||m.kind==="records"){
+            body.className="abody doc "+m.kind; body.innerHTML=m.html||"";
+          }else if(m.kind==="image"){
+            body.textContent="";
+            const i=new Image();
+            // Its own route, not a query flag: do_GET strips the query before
+            // dispatch, so the ?raw=1 version handed this <img> a JSON body.
+            i.src="/api/attachraw/"+side+"/"+id+"/"+att;
+            // maxWidth alone still let a 200px signature logo be drawn at pane
+            // width by the flex/grid context around it, which is what made
+            // every inline image look blurred. Cap at the file's OWN size.
+            i.style.maxWidth="100%"; i.style.width="auto"; i.style.height="auto";
+            i.onload=()=>{ if(i.naturalWidth) i.style.maxWidth=
+              Math.min(i.naturalWidth, 100000)+"px"; };
+            i.onerror=()=>{
+              body.innerHTML="<span class=why>image would not decode</span>";};
+            body.appendChild(i);
+          }else if(m.kind==="empty"){
+            body.innerHTML="<span class=why>"+esc(m.why||"empty file")+"</span>";
+          }else if(m.kind==="raw"){
+            body.textContent="";
+            const f=document.createElement("iframe");
+            f.src="/api/attachraw/"+side+"/"+id+"/"+att;
+            f.style.width="100%"; f.style.height="420px"; f.style.border="0";
+            body.appendChild(f);
+          }else{
+            body.innerHTML="<span class=why>"+esc(m.why||"no viewer for this one")+"</span>"+
+              " <a class=raw href='/api/attachraw/"+side+"/"+id+"/"+att+"' download>download</a>";
+          }
+          // The pane grew, and these marks are the attachment's own -- scored
+          // from ITS two sides, not the mail's, so a name that leaked inside
+          // the spreadsheet lights up the way one in the body does.
+          linkScroll(LS,RS);
+          fetch("/api/pii?sid="+id+"&att="+att).then(r=>r.json()).then(px=>{
+            markWith(body,side,px);
+          }).catch(()=>{});
+        }).catch(e=>{body.textContent=String(e);});
+      });
+    });
+  });
 }
 
 /* Record N starts at the same height on both sides.
@@ -2107,8 +2725,17 @@ function paneHeads(p){
   el("rhp").title=p.right||"";
 }
 function render(){
-  if(!head()){ el("lp").innerHTML=el("rp").innerHTML=
-    "<div class='empty'>Nothing here. Press <b>a</b> for all files, or clear the search."+
+  if(!head()){
+    // "nothing matches" for a file that IS in the run is the single most
+    // misleading thing this screen can say, and it happens constantly: the
+    // unreviewed-only filter hides everything you already looked at. Count
+    // what the query DOES match and name the filter that is hiding it.
+    const hid = onlyNew ? pool().filter(matches).length : 0;
+    el("lp").innerHTML=el("rp").innerHTML=
+    "<div class='empty'>"+
+    (hid ? "<b>"+num(hid)+" "+(hid===1?"match is":"matches are")+
+           " hidden by <i>unreviewed only</i>.</b><br>Press <b>a</b> to show them."
+         : "Nothing here. Press <b>a</b> for all files, or clear the search.")+
     (q()?"<br><span class='why'>The search covered all "+num(TOTAL)+" pairs in the run, not just your sample.</span>":"")+
     "</div>"; return; }
   const p=VIEW[i];
@@ -2291,7 +2918,14 @@ addEventListener("keydown",e=>{
     return;
   }
   if(e.target.tagName==="INPUT"||e.target.tagName==="SELECT"){
-    if(e.key==="Escape") e.target.blur();
+    if(e.key==="Escape"){ e.target.blur(); return; }
+    // Arrows walk the results WITHOUT leaving the search box. Typing a query
+    // and then having to click away to move is the single thing that made the
+    // search feel broken: the box is where you already are.
+    if(e.target.id==="q"&&(e.key==="ArrowDown"||e.key==="ArrowUp")){
+      e.preventDefault(); go(e.key==="ArrowDown"?1:-1);
+    }
+    if(e.target.id==="q"&&e.key==="Enter"){ e.preventDefault(); e.target.blur(); }
     return;
   }
   if(e.metaKey||e.ctrlKey||e.altKey)return;
@@ -2430,6 +3064,33 @@ def inspect_root(root: str, profile: str | None) -> dict:
     # recents list and marks.json will be keyed by -- one run, one entry.
     out["root"] = st.spec
     return out
+
+
+def search_rows(rows, look: str):
+    """Pairs matching every term in `look`, best first.
+
+    Terms rather than one substring, because a reviewer types what they
+    remember -- "gmail drafts 15b1" -- not a contiguous slice of a path they
+    have never seen. Ranked so a reported FILENAME lands first: an exact
+    basename, then a basename that contains the query, then anything else,
+    which is what makes typing a name from a bug report land on that file
+    instead of the two hundred pairs whose folder happens to contain it.
+    """
+    terms = (look or "").lower().split()
+    if not terms:
+        return []
+    out = []
+    for r in rows:
+        hay = f"{r['label']} {r.get('left') or ''} {r.get('right') or ''}".lower()
+        if not all(t in hay for t in terms):
+            continue
+        base = r["label"].rsplit("/", 1)[-1].lower()
+        joined = " ".join(terms)
+        rank = 0 if base == joined else 1 if joined in base else \
+            2 if all(t in base for t in terms) else 3
+        out.append((rank, r["label"], r))
+    out.sort(key=lambda t: (t[0], t[1]))
+    return [t[2] for t in out]
 
 
 #: Rows one search returns. A substring like "page" matches thirty thousand
@@ -2785,10 +3446,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             rows = S.get("rows") or []
             if not look:
                 return self._json({"rows": [], "matched": 0, "total": len(rows)})
-            hit = [r for r in rows
-                   if look in r["label"].lower()
-                   or look in (r["right"] or "").lower()
-                   or look in r["left"].lower()]
+            hit = search_rows(rows, look)
             return self._json({"rows": hit[:SEARCH_MAX], "matched": len(hit),
                                "total": len(rows), "cap": SEARCH_MAX})
         if path == "/api/pii":
@@ -2805,11 +3463,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 row = S["rows"][int(sid)]
                 # Per user, not per run -- see resolve_map.
                 user = (row.get("label") or "").split("/")[0]
+                # ?att=N scores ONE opened attachment instead of the mail.
+                # Its own sid slot so the derived vocabulary learns it as a
+                # separate document -- folding it into the mail's own counts
+                # would teach the same tokens twice.
+                att = (q.get("att") or [""])[0].strip()
                 lt = rt = ""
-                if row["left"]:
-                    lt = _doc_text("left", sid, row["left"], S["left_store"])
-                if row["right"]:
-                    rt = _doc_text("right", sid, row["right"], S["right_store"])
+                if att:
+                    sid = f"{sid}#a{att}"
+                    if row["left"]:
+                        lt = _attachment_text(
+                            S["left_store"].cached_read(row["left"]), int(att))
+                    if row["right"]:
+                        rt = _attachment_text(
+                            S["right_store"].cached_read(row["right"]), int(att))
+                else:
+                    if row["left"]:
+                        lt = _doc_text("left", sid, row["left"], S["left_store"])
+                    if row["right"]:
+                        rt = _doc_text("right", sid, row["right"], S["right_store"])
                 # No mapping table for this user -- derive the marks from the
                 # two panes instead. Highlighting is the whole point of the
                 # tool, so it degrades rather than switching off.
@@ -2887,6 +3559,53 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self._json({"kind": "pdf",
                                        "pages": RENDER.pages(f"{side}:{sid}", data)})
                 return self._json(shape)
+            except Exception as exc:  # noqa: BLE001 -- surfaced on the card
+                return self._json({"kind": "other",
+                                   "why": f"{type(exc).__name__}: {exc}"[:200]})
+        if path.startswith("/api/attachraw/"):
+            # Its own path, not a query on /api/attach/: do_GET dispatches on
+            # the path with the query already stripped, so a ?raw=1 flag was
+            # dropped before it got here and every <img> was handed JSON.
+            try:
+                _, _, _, side, sid, n = path.split("/", 5)
+                row = S["rows"][int(sid)]
+                key = row["left"] if side == "left" else row["right"]
+                if key is None:
+                    return self._send(b"no counterpart", "text/plain", 404)
+                store = S["left_store"] if side == "left" else S["right_store"]
+                _, ctype, blob = _attachment_from_eml(store.cached_read(key), int(n))
+                return self._send(blob, ctype or "application/octet-stream")
+            except Exception as exc:  # noqa: BLE001
+                return self._send(str(exc).encode()[:300], "text/plain", 404)
+        if path.startswith("/api/attach/"):
+            # An attachment is a document inside a document. Extract it and
+            # hand it to the SAME view(), so a .xlsx inside a mail renders as
+            # the table a loose .xlsx would, for free.
+            try:
+                _, _, _, side, sid, n = path.split("/", 5)
+                row = S["rows"][int(sid)]
+                key = row["left"] if side == "left" else row["right"]
+                if key is None:
+                    return self._json({"kind": "none"})
+                store = S["left_store"] if side == "left" else S["right_store"]
+                name, ctype, blob = _attachment_from_eml(store.cached_read(key), int(n))
+                shape = view(view_key(name, ctype), blob)
+                # "BadZipFile: File is not a zip file" is true and useless. On
+                # this corpus it means the run REPLACED a 1.3 MB workbook with
+                # a 67-byte stub -- the finding is the substitution, not the
+                # parser, and the reviewer needs to read it as one.
+                if shape.get("kind") == "other" and len(blob) < 4096:
+                    shape = dict(shape, why=(
+                        f"{_size(len(blob))} of data, which is not a valid "
+                        f"{Path(view_key(name, ctype)).suffix or 'file'} \u2014 "
+                        f"the run appears to have replaced this attachment"))
+                if shape["kind"] == "pdf":
+                    # Same route a loose PDF takes when PyMuPDF is absent: the
+                    # browser's own plugin, which SHOWS a pdf rather than
+                    # saving it. /api/attachraw serves the bytes with the
+                    # right content type, so the frame renders in place.
+                    shape = {"kind": "raw"}
+                return self._json(dict(shape, name=name))
             except Exception as exc:  # noqa: BLE001 -- surfaced on the card
                 return self._json({"kind": "other",
                                    "why": f"{type(exc).__name__}: {exc}"[:200]})
