@@ -1049,6 +1049,20 @@ MAP_NAMES = ("pii_mappings.db", "mappings.db")
 #: any table this tool could draw: sort, filter, join, export, 400k rows.
 TABLEPLUS = Path("/Applications/TablePlus.app")
 
+#: Schemes TablePlus opens as a CONNECTION rather than a file.
+DB_SCHEMES = {"postgres", "postgresql", "mysql", "mariadb", "redis",
+              "mssql", "sqlserver", "mongodb"}
+
+
+def _safe_url(text: str) -> str:
+    """The same string with any URL password replaced.
+
+    This goes back to the browser and into the banner. A mapping database URL
+    carries the run's credentials and there is no reason for them to make the
+    round trip.
+    """
+    return re.sub(r"(://[^:/@\s]+):[^@/\s]*@", r"\1:***@", text)
+
 
 def fetch_mappings(spec: str, profile: str | None) -> str:
     """A remote mapping database, pulled to a local file. TablePlus needs one."""
@@ -1083,11 +1097,17 @@ def open_mappings(spec: str | None, profile: str | None, app: Path = TABLEPLUS,
         return {"ok": False, "why": "TablePlus is not installed.",
                 "install": "brew install --cask tableplus"}
     try:
+        if spec.split("://", 1)[0] in DB_SCHEMES:
+            # The real mapping database is Postgres on RDS, one instance per
+            # run. There is no file to hand over: TablePlus registers these
+            # schemes, so the URL itself is what gets opened.
+            subprocess.run(["open", spec], check=True)
+            return {"ok": True, "where": _safe_url(spec)}
         local = fetch(spec, profile) if stores.parse_s3(spec) else spec
         subprocess.run(["open", "-a", str(app), local], check=True)
     except Exception as exc:  # noqa: BLE001 -- shown on the button, not raised
-        return {"ok": False, "why": f"{type(exc).__name__}: {exc}"[:200]}
-    return {"ok": True, "path": local}
+        return {"ok": False, "why": _safe_url(f"{type(exc).__name__}: {exc}")[:200]}
+    return {"ok": True, "where": local}
 
 
 def find_mappings(store) -> str | None:
@@ -1265,6 +1285,10 @@ def resolve_map(spec: str, profile: str | None, user: str | None) -> str | None:
     if not spec:
         return None
     if spec.lower().endswith((".db", ".sqlite", ".sqlite3")):
+        return spec
+    # A connection URL is the database itself, not a folder to search per
+    # user. The real mapping DB is one Postgres instance per run.
+    if spec.split("://", 1)[0] in DB_SCHEMES:
         return spec
     if not user:
         return None
@@ -1845,7 +1869,7 @@ kbd{font:11px ui-monospace,Menlo,monospace;background:var(--soft);border:1px sol
   <button id="rev"><span id="revic"></span><span id="revtx">Review</span></button>
   <input id="cbox" placeholder="add a comment…" spellcheck="false">
   <span class="count" id="count"></span>
-  <button class="icobtn" id="mapbtn" title="open the run&#39;s PII mapping table in TablePlus  (m)">PII mappings</button>
+  <button class="icobtn" id="mapbtn" title="open the run&#39;s mapping DB in TablePlus  (m)">Mapping DB</button>
   <button class="icobtn" id="infobtn" title="details  (i)">i</button>
   <span id="split" title="change what is compared"></span>
 </header>
@@ -1870,7 +1894,7 @@ kbd{font:11px ui-monospace,Menlo,monospace;background:var(--soft);border:1px sol
   <span><kbd>enter</kbd> review + next · <kbd>r</kbd> review · <kbd>c</kbd> comment</span>
   <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> file · <kbd>&larr;</kbd><kbd>&rarr;</kbd> folder · <kbd>[</kbd><kbd>]</kbd> page</span>
   <span><kbd>a</kbd> <span id="mode">unreviewed only</span></span>
-  <span id="mapfoot" class="clik"><kbd>m</kbd> mappings in TablePlus</span>
+  <span id="mapfoot" class="clik"><kbd>m</kbd> mapping DB</span>
   <span><kbd>s</kbd> list · <kbd>i</kbd> details · <kbd>y</kbd> <span id="hil" title="highlight PII  (h)">pii on</span>
   <span id="syn">sync on</span> · <kbd>?</kbd> keys</span>
   <input id="jump" placeholder="jump # or name">
@@ -2801,7 +2825,7 @@ async function maps(){
   catch(e){ r={why:String(e)}; }
   btn.textContent=was;
   if(r.ok) return;
-  el("btext").textContent=(r.why||"could not open the mapping table")+
+  el("btext").textContent=(r.why||"could not open the mapping DB")+
     (r.install?"   Install it with:  "+r.install:"");
   el("bfix").style.display="none";
   el("banner").classList.add("on");

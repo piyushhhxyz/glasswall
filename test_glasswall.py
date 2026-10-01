@@ -1545,6 +1545,29 @@ class TablePlus(unittest.TestCase):
         self.assertIn("no mapping database", out["why"].lower())
         self.assertEqual(self.ran, [])
 
+    def test_an_rds_url_opens_as_a_connection_not_a_file(self):
+        # The real mapping database is Postgres on RDS, one per run
+        # (sail-export-<unit>-pii-db). There is no file to fetch: TablePlus
+        # registers the postgres:// scheme, so the URL IS the thing to open.
+        out = review.open_mappings(
+            "postgresql://piiuser:pw@sail-export-d1-pii-db.rds.amazonaws.com:5432/pii",
+            None, app=self.dir)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(self.ran[0][0], "open")
+        self.assertTrue(self.ran[0][-1].startswith("postgresql://"))
+        self.assertNotIn("-a", self.ran[0])     # scheme handler, not a file
+
+    def test_a_mysql_url_opens_too(self):
+        out = review.open_mappings("mysql://u:p@h:3306/db", None, app=self.dir)
+        self.assertTrue(out["ok"], out)
+        self.assertTrue(self.ran[0][-1].startswith("mysql://"))
+
+    def test_a_connection_url_is_never_printed_back(self):
+        # The result goes to the browser. A password must not ride along.
+        out = review.open_mappings("postgresql://piiuser:hunter2@h:5432/pii",
+                                   None, app=self.dir)
+        self.assertNotIn("hunter2", json.dumps(out))
+
     def test_a_remote_database_is_fetched_before_opening(self):
         # TablePlus cannot open s3://. The file has to land locally first, and
         # the path it lands at is what gets opened.
