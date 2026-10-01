@@ -1542,7 +1542,7 @@ class TablePlus(unittest.TestCase):
     def test_no_database_is_reported_not_launched(self):
         out = review.open_mappings(None, None, app=self.dir)
         self.assertFalse(out["ok"])
-        self.assertIn("no mapping database", out["why"].lower())
+        self.assertIn("not started with a mapping db", out["why"].lower())
         self.assertEqual(self.ran, [])
 
     def test_an_rds_url_opens_as_a_connection_not_a_file(self):
@@ -1567,6 +1567,31 @@ class TablePlus(unittest.TestCase):
         out = review.open_mappings("postgresql://piiuser:hunter2@h:5432/pii",
                                    None, app=self.dir)
         self.assertNotIn("hunter2", json.dumps(out))
+
+    def test_a_failure_hands_back_something_to_copy(self):
+        # "CalledProcessError: Command [...] returned non-zero exit status 1"
+        # is true and useless. When the open fails the reviewer needs the
+        # thing they would paste into TablePlus themselves.
+        def boom(cmd, **kw):
+            raise OSError("nope")
+        review.subprocess.run = boom
+        out = review.open_mappings("postgresql://piiuser:pw@h:5432/pii", None,
+                                   app=self.dir)
+        self.assertFalse(out["ok"])
+        self.assertTrue(out["copy"], out)
+        self.assertNotIn("pw", out["copy"])        # still redacted
+
+    def test_a_missing_file_says_the_file_is_missing(self):
+        gone = self.dir / "not-here.db"
+        out = review.open_mappings(str(gone), None, app=self.dir)
+        self.assertFalse(out["ok"])
+        self.assertIn("no longer there", out["why"].lower())
+        self.assertEqual(self.ran, [])
+
+    def test_no_database_hands_back_the_flag_to_copy(self):
+        out = review.open_mappings(None, None, app=self.dir)
+        self.assertFalse(out["ok"])
+        self.assertIn("--mappings", out["copy"])
 
     def test_a_remote_database_is_fetched_before_opening(self):
         # TablePlus cannot open s3://. The file has to land locally first, and

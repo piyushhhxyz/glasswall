@@ -1089,15 +1089,26 @@ def open_mappings(spec: str | None, profile: str | None, app: Path = TABLEPLUS,
     Returns a result rather than raising: "TablePlus is not installed" is a
     thing to say on screen with the command to fix it, not a traceback.
     """
+    # Whatever happens, the reviewer gets the thing they would otherwise have
+    # to reconstruct by hand. A failure that only names a python exception
+    # leaves them with nothing to do about it.
     if not spec:
-        return {"ok": False, "why": "This run has no mapping database. "
-                "The pipeline writes pii_mappings.db beside the run and it is "
-                "often not uploaded with the output."}
+        return {"ok": False,
+                "why": "This run was not started with a mapping DB.",
+                "copy": "--mappings postgresql://piiuser:PASSWORD@"
+                        "sail-export-<unit>-pii-db.cf0k8my80k8e."
+                        "ap-south-1.rds.amazonaws.com:5432/pii"}
+    url = spec.split("://", 1)[0] in DB_SCHEMES
     if not app.exists():
         return {"ok": False, "why": "TablePlus is not installed.",
-                "install": "brew install --cask tableplus"}
+                "install": "brew install --cask tableplus",
+                "copy": _safe_url(spec)}
+    if not url and not stores.parse_s3(spec) and not Path(spec).expanduser().exists():
+        return {"ok": False,
+                "why": f"The mapping DB is no longer there: {spec}",
+                "copy": spec}
     try:
-        if spec.split("://", 1)[0] in DB_SCHEMES:
+        if url:
             # The real mapping database is Postgres on RDS, one instance per
             # run. There is no file to hand over: TablePlus registers these
             # schemes, so the URL itself is what gets opened.
@@ -1106,7 +1117,9 @@ def open_mappings(spec: str | None, profile: str | None, app: Path = TABLEPLUS,
         local = fetch(spec, profile) if stores.parse_s3(spec) else spec
         subprocess.run(["open", "-a", str(app), local], check=True)
     except Exception as exc:  # noqa: BLE001 -- shown on the button, not raised
-        return {"ok": False, "why": _safe_url(f"{type(exc).__name__}: {exc}")[:200]}
+        return {"ok": False,
+                "why": _safe_url(f"TablePlus did not open it ({type(exc).__name__}).")[:200],
+                "copy": _safe_url(spec)}
     return {"ok": True, "where": local}
 
 
@@ -2825,9 +2838,20 @@ async function maps(){
   catch(e){ r={why:String(e)}; }
   btn.textContent=was;
   if(r.ok) return;
+  // Whatever went wrong, leave something on the clipboard. A banner that
+  // only names an exception leaves the reviewer with nothing to do next.
+  const give=r.install||r.copy||"";
   el("btext").textContent=(r.why||"could not open the mapping DB")+
-    (r.install?"   Install it with:  "+r.install:"");
-  el("bfix").style.display="none";
+    (r.install?"  Install it with:  "+r.install:give?"  "+give:"");
+  if(give){
+    el("bfix").textContent="copy";
+    el("bfix").style.display="";
+    el("bfix").onclick=()=>{
+      navigator.clipboard.writeText(give).then(
+        ()=>{el("bfix").textContent="copied";},
+        ()=>{el("bfix").textContent="select it";});
+    };
+  }else el("bfix").style.display="none";
   el("banner").classList.add("on");
 }
 
