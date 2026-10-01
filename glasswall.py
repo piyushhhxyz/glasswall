@@ -1727,17 +1727,10 @@ body.rz{cursor:col-resize;user-select:none}
 .fold:hover{background:var(--soft)}
 .fold[aria-current=true]{background:var(--sel);border-left-color:var(--ok)}
 .fold .ic{flex:0 0 auto;display:flex;color:var(--mut)}
-/* Name left, progress right, one line. The count is the thing being scanned
-   down the column, so it is tabular and right-aligned -- ragged digits make
-   a column of them unreadable. */
-.fold .tx{min-width:0;flex:1;display:flex;align-items:baseline;gap:8px}
-.fold .n{font:11.5px ui-monospace,Menlo,monospace;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap;flex:1}
-.fold .cnt{flex:0 0 auto;font-size:10.5px;color:var(--mut);
-  font-variant-numeric:tabular-nums;white-space:nowrap}
-.fold .cnt b{font-weight:600;color:var(--fg)}
-.fold .cnt .w{color:var(--warn)}
-.fold .cnt .nt{color:var(--mut)}
+.fold .tx{min-width:0;flex:1}
+.fold .n{font:11.5px ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fold .m{font-size:10.5px;color:var(--mut);margin-top:1px}
+.fold .m .w{color:var(--warn)}
 .file{padding:4px 9px 4px 26px;font:11px ui-monospace,Menlo,monospace;cursor:pointer;display:flex;gap:6px;align-items:center;color:var(--mut)}
 .file:hover{background:var(--soft);color:var(--fg)}
 .file[aria-current=true]{background:var(--sel);color:var(--fg);font-weight:600}
@@ -2114,20 +2107,18 @@ function folderRow(name,arr,go){
   const sub=new Set();
   arr.forEach(p=>{const r=p.label.slice(name.length+1); const ix=r.indexOf("/");
     if(ix>0) sub.add(r.slice(0,ix));});
-  // Progress, on one line, right-aligned. The old row spent two lines and
-  // five facts -- file count, reviewed, bytes, percent, subfolders -- on
-  // every folder, so the one number a reviewer actually scans for ("how much
-  // of this is left") had to be read out of a sentence, and the tree was half
-  // as tall as it could be. Only what is exceptional keeps words: missing
-  // counterparts, and comments that are waiting on someone.
-  const bits=[];
+  const bits=[`${arr.length} file${arr.length===1?"":"s"}`];
+  if(done) bits.push(done===arr.length?"all reviewed":`${done} reviewed`);
+  else if(arr.length) bits.push(`${arr.length} to go`);
+  if(bytes) bits.push(kb(bytes)+(TOTB?` · ${Math.round(bytes*100/TOTB)}%`:""));
+  if(sub.size) bits.push(`${sub.size} folder${sub.size===1?"":"s"}`);
+  if(note) bits.push(`${note} comment${note===1?"":"s"}`);
   if(miss) bits.push(`<span class="w">${miss} missing</span>`);
-  if(note) bits.push(`<span class="nt">${note}&#9679;</span>`);
   const d=document.createElement("div"); d.className="fold";
   d.innerHTML=`<span class="tw">&#9656;</span>
     <span class="ic">${done>=arr.length&&arr.length?ICON.done:ICON.folder}</span>
-    <span class="tx"><span class="n">${esc(name.split("/").pop())}</span>
-    <span class="cnt">${bits.join(" ")} <b>${done}</b>/${arr.length}</span></span>`;
+    <span class="tx"><div class="n">${esc(name.split("/").pop())}</div>
+    <div class="m">${bits.join(" · ")}</div></span>`;
   d.onclick=go;
   return d;
 }
