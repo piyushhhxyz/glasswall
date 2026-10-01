@@ -1511,5 +1511,63 @@ class Searching(unittest.TestCase):
     def test_an_empty_query_matches_nothing(self):
         self.assertEqual(review.search_rows(self.ROWS, "   "), [])
 
+class ListingCache(unittest.TestCase):
+    """Re-listing a remote export on every start is the whole boot cost."""
+
+    class Fake(stores.Store):
+        kind = "s3"
+
+        def __init__(self, spec):
+            super().__init__(spec)
+            self.calls = 0
+            self._size_map = {}
+
+        def _list(self):
+            self.calls += 1
+            self._size_map = {"a.eml": 11}
+            return ["a.eml", "b.eml"]
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self._old, stores.LIST_CACHE = stores.LIST_CACHE, self.dir
+
+    def tearDown(self):
+        stores.LIST_CACHE = self._old
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_a_second_store_on_the_same_spec_does_not_relist(self):
+        a = self.Fake("s3://b/x"); self.assertEqual(a.paths, ["a.eml", "b.eml"])
+        b = self.Fake("s3://b/x"); self.assertEqual(b.paths, ["a.eml", "b.eml"])
+        self.assertEqual((a.calls, b.calls), (1, 0))
+
+    def test_sizes_survive_the_cache(self):
+        # Pairing falls back to size order; a cache that dropped sizes would
+        # silently change which pairs get matched.
+        self.Fake("s3://b/y").paths                 # warms the cache
+        second = self.Fake("s3://b/y")
+        second.paths                                # served from it
+        self.assertEqual(second.calls, 0)
+        self.assertEqual(second._size_map, {"a.eml": 11})
+
+    def test_a_different_location_is_not_served_the_cache(self):
+        self.Fake("s3://b/one").paths
+        other = self.Fake("s3://b/two"); other.paths
+        self.assertEqual(other.calls, 1)
+
+    def test_a_stale_entry_is_relisted(self):
+        a = self.Fake("s3://b/z"); a.paths
+        for f in self.dir.glob("*.json"):
+            os.utime(f, (0, 0))
+        b = self.Fake("s3://b/z"); b.paths
+        self.assertEqual(b.calls, 1)
+
+    def test_a_local_folder_is_never_cached(self):
+        class Local(self.Fake):
+            kind = "dir"
+        a = Local("/tmp/x"); a.paths
+        b = Local("/tmp/x"); b.paths
+        self.assertEqual(b.calls, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

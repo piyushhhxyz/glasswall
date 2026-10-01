@@ -3295,6 +3295,10 @@ def open_review(root=None, left=None, right=None, profile=None,
     counts["by_how"]["missing"] = 0 if partial else len(idx["unmatched_left"])
     counts["partial"] = partial
     print(f"  {len(rows)} documents  {counts['by_how']}", flush=True)
+    # Never let a cached listing be a silent surprise: a re-run of the
+    # pipeline inside the hour is exactly when someone needs to know.
+    if getattr(ls, "cached_listing", False) or getattr(rs, "cached_listing", False):
+        print("  file list from cache (GLASSWALL_NO_CACHE=1 to re-list)", flush=True)
     if idx["unmatched_right"]:
         print(f"  {len(idx['unmatched_right'])} output file(s) with no source", flush=True)
 

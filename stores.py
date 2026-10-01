@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import concurrent.futures as cf
 import functools
+import hashlib
+import json
+import os
+import time
 import io
 import random
 import re
@@ -29,6 +33,14 @@ DOC_EXTS = {
     # it, so a leak in a .sql dump or a .env was invisible in review.
     ".log", ".yaml", ".yml", ".ini", ".cfg", ".sql", ".vcf", ".ics", ".env",
 }
+
+#: Where a remote listing is remembered between runs, and for how long.
+#: An hour is long enough to cover a day of restarts against one delivery and
+#: short enough that a re-run of the pipeline is picked up without anyone
+#: having to know this cache exists. GLASSWALL_NO_CACHE=1 skips it.
+LIST_CACHE = Path.home() / ".cache" / "glasswall" / "listings"
+LIST_TTL = 3600
+
 
 #: macOS zip cruft and VCS. Pipeline bookkeeping is caught by the underscore
 #: rule below rather than listed, because every stage names its own.
@@ -91,6 +103,40 @@ class Store:
                 pass
         threading.Thread(target=_run, daemon=True).start()
 
+    def _listing(self) -> list[str]:
+        """_list(), but remembered on disk for a remote location.
+
+        Listing a delivered export is a few hundred sequential round trips --
+        forty seconds of blank screen on d1 -- and it is paid again on every
+        restart, which during a day of tuning the viewer is most of the day.
+        Only remote kinds are cached: a local folder lists in milliseconds and
+        is the one a reviewer is likely to be changing underneath the tool.
+        Sizes ride along because pairing falls back to size order, and a cache
+        that dropped them would quietly change which pairs get matched.
+        """
+        if self.kind == "dir" or os.environ.get("GLASSWALL_NO_CACHE"):
+            return self._list()
+        key = hashlib.sha1(repr(self).encode()).hexdigest()[:16]
+        f = LIST_CACHE / f"{key}.json"
+        try:
+            if time.time() - f.stat().st_mtime < LIST_TTL:
+                d = json.loads(f.read_text())
+                if d.get("spec") == repr(self):
+                    self._size_map = {**getattr(self, "_size_map", {}),
+                                      **(d.get("sizes") or {})}
+                    self.cached_listing = True
+                    return d["keys"]
+        except Exception:  # noqa: BLE001 -- a bad cache must never be fatal
+            pass
+        keys = self._list()
+        try:
+            LIST_CACHE.mkdir(parents=True, exist_ok=True)
+            f.write_text(json.dumps({"spec": repr(self), "keys": keys,
+                                     "sizes": getattr(self, "_size_map", {})}))
+        except Exception:  # noqa: BLE001
+            pass
+        return keys
+
     @functools.cached_property
     def paths(self) -> list[str]:
         """Everything listed, minus obvious junk. No document filtering.
@@ -101,7 +147,7 @@ class Store:
         left that side empty.
         """
         return sorted(
-            p for p in self._list()
+            p for p in self._listing()
             if not any(seg in NOISE_DIRS for seg in Path(p).parts)
         )
 
