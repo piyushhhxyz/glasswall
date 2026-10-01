@@ -200,69 +200,6 @@ class AlignBySize(unittest.TestCase):
         self.assertEqual(len(idx["pairs"]), 1)
 
 
-class MappingPanel(unittest.TestCase):
-    """The run's substitution table, browsed like a database."""
-
-    def rows(self, spec):
-        return [{"attribute_type": k, "original": f"{k}-{n:04d}",
-                 "replacement": f"x{n}"}
-                for k, c in spec.items() for n in range(c)]
-
-    def test_every_type_comes_back_with_its_real_count(self):
-        # The sidebar is the index into a hundred thousand rows. A count that
-        # reflected the page rather than the type would make it useless.
-        out = review.browse_mappings(self.rows({"aadhaar": 22, "email": 51997}))
-        self.assertEqual([t["type"] for t in out["types"]], ["aadhaar", "email"])
-        self.assertEqual([t["total"] for t in out["types"]], [22, 51997])
-
-    def test_selecting_a_type_pages_only_that_type(self):
-        rows = self.rows({"email": 500, "ifsc": 3})
-        out = review.browse_mappings(rows, kind="ifsc")
-        self.assertEqual(out["total"], 3)
-        self.assertTrue(all(r["attribute_type"] == "ifsc" for r in out["rows"]))
-        # The sidebar still shows everything, or you cannot get back out.
-        self.assertEqual(len(out["types"]), 2)
-
-    def test_nothing_is_sampled_away(self):
-        # Documents are sampled because nobody reads 34,000 of them. This is
-        # the table the reviewer is checking, so a row that exists has to be
-        # reachable -- every one of them, in order, by paging.
-        rows = self.rows({"email": 450})
-        seen = []
-        off = 0
-        while True:
-            out = review.browse_mappings(rows, offset=off, limit=200)
-            seen += [r["original"] for r in out["rows"]]
-            off += len(out["rows"])
-            if off >= out["total"]:
-                break
-        self.assertEqual(seen, [r["original"] for r in rows])
-
-    def test_paging_is_stable_and_does_not_overlap(self):
-        rows = self.rows({"email": 500})
-        a = review.browse_mappings(rows, offset=0, limit=200)["rows"]
-        b = review.browse_mappings(rows, offset=200, limit=200)["rows"]
-        self.assertEqual(len(set(r["original"] for r in a + b)), 400)
-        self.assertEqual(a, review.browse_mappings(rows, offset=0, limit=200)["rows"])
-
-    def test_search_spans_every_type(self):
-        rows = self.rows({"email": 20, "ifsc": 20})
-        out = review.browse_mappings(rows, look="-0003")
-        self.assertEqual({t["type"] for t in out["types"]}, {"email", "ifsc"})
-        self.assertEqual(out["matched"], 2)
-
-    def test_search_inside_a_selected_type(self):
-        rows = self.rows({"email": 20, "ifsc": 20})
-        out = review.browse_mappings(rows, kind="email", look="-0003")
-        self.assertEqual(out["total"], 1)
-        # ...and still reports that the other type has a hit, so the sidebar
-        # does not hide it.
-        self.assertEqual(out["matched"], 2)
-
-    def test_a_search_that_matches_nothing_says_so(self):
-        out = review.browse_mappings(self.rows({"email": 5}), look="zzz")
-        self.assertEqual((out["total"], out["types"]), (0, []))
-
 class PerReviewerSample(unittest.TestCase):
     """Two people on one run should not spend the day on the same hundred."""
 
@@ -1567,6 +1504,61 @@ class ListingCache(unittest.TestCase):
         a = Local("/tmp/x"); a.paths
         b = Local("/tmp/x"); b.paths
         self.assertEqual(b.calls, 1)
+
+class TablePlus(unittest.TestCase):
+    """The mapping table is a sqlite file. A sqlite client beats a web table."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.db = self.dir / "pii_mappings.db"
+        self.db.write_bytes(b"SQLite format 3\x00")
+        self.ran = []
+        self._run, review.subprocess.run = review.subprocess.run, self.fake_run
+
+    def tearDown(self):
+        review.subprocess.run = self._run
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def fake_run(self, cmd, **kw):
+        self.ran.append(cmd)
+        class R:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+        return R()
+
+    def test_a_local_database_opens_straight_in_tableplus(self):
+        out = review.open_mappings(str(self.db), None, app=self.dir)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(self.ran[0][:2], ["open", "-a"])
+        self.assertIn(str(self.db), self.ran[0])
+
+    def test_a_missing_tableplus_says_how_to_install(self):
+        out = review.open_mappings(str(self.db), None, app=self.dir / "nope.app")
+        self.assertFalse(out["ok"])
+        self.assertIn("brew install --cask tableplus", out["install"])
+        self.assertEqual(self.ran, [])          # nothing was launched
+
+    def test_no_database_is_reported_not_launched(self):
+        out = review.open_mappings(None, None, app=self.dir)
+        self.assertFalse(out["ok"])
+        self.assertIn("no mapping database", out["why"].lower())
+        self.assertEqual(self.ran, [])
+
+    def test_a_remote_database_is_fetched_before_opening(self):
+        # TablePlus cannot open s3://. The file has to land locally first, and
+        # the path it lands at is what gets opened.
+        calls = []
+
+        def fake_fetch(spec, profile):
+            calls.append((spec, profile))
+            return str(self.db)
+
+        out = review.open_mappings("s3://bucket/pii_mappings.db", "sail",
+                                   app=self.dir, fetch=fake_fetch)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(calls, [("s3://bucket/pii_mappings.db", "sail")])
+        self.assertIn(str(self.db), self.ran[0])
 
 
 if __name__ == "__main__":

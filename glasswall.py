@@ -24,6 +24,7 @@ import re
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -1044,6 +1045,51 @@ _CANNOT = {
 MAP_NAMES = ("pii_mappings.db", "mappings.db")
 
 
+#: The mapping table is a sqlite file, and a sqlite client is better at it than
+#: any table this tool could draw: sort, filter, join, export, 400k rows.
+TABLEPLUS = Path("/Applications/TablePlus.app")
+
+
+def fetch_mappings(spec: str, profile: str | None) -> str:
+    """A remote mapping database, pulled to a local file. TablePlus needs one."""
+    dest = Path(tempfile.gettempdir()) / "glasswall-mappings" / Path(spec).name
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["aws", "s3", "cp", spec, str(dest)]
+    if profile:
+        cmd += ["--profile", profile]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode or not dest.exists():
+        raise RuntimeError((r.stderr or b"").decode("utf8", "replace")[:200])
+    return str(dest)
+
+
+def open_mappings(spec: str | None, profile: str | None, app: Path = TABLEPLUS,
+                  fetch=fetch_mappings) -> dict:
+    """Hand the run's mapping database to TablePlus.
+
+    Replaces a table browser that reimplemented sort, filter and paging badly
+    over a file every sqlite client already opens well. What a reviewer does
+    with this table -- join it, sort by type, export a slice, grep 400k rows --
+    is what a real client is for.
+
+    Returns a result rather than raising: "TablePlus is not installed" is a
+    thing to say on screen with the command to fix it, not a traceback.
+    """
+    if not spec:
+        return {"ok": False, "why": "This run has no mapping database. "
+                "The pipeline writes pii_mappings.db beside the run and it is "
+                "often not uploaded with the output."}
+    if not app.exists():
+        return {"ok": False, "why": "TablePlus is not installed.",
+                "install": "brew install --cask tableplus"}
+    try:
+        local = fetch(spec, profile) if stores.parse_s3(spec) else spec
+        subprocess.run(["open", "-a", str(app), local], check=True)
+    except Exception as exc:  # noqa: BLE001 -- shown on the button, not raised
+        return {"ok": False, "why": f"{type(exc).__name__}: {exc}"[:200]}
+    return {"ok": True, "path": local}
+
+
 def find_mappings(store) -> str | None:
     """The run's mapping database inside an output location, if it shipped one.
 
@@ -1408,35 +1454,6 @@ def map_key(row: dict) -> str:
     return hashlib.sha1(raw.encode("utf8", "replace")).hexdigest()[:16]
 
 
-def browse_mappings(rows, kind: str | None = None, look: str = "",
-                    offset: int = 0, limit: int = PAGE_ROWS) -> dict:
-    """One page of the mappings table, exactly as the run wrote it.
-
-    No sampling. An earlier version showed a seeded handful per type, which is
-    right for documents -- nobody reads 34,000 of them -- and wrong here: this
-    is the run's substitution table and the reviewer is checking it, so a row
-    that exists has to be reachable. Types come back with their real counts so
-    the sidebar can show what the run actually did, and the rows themselves
-    are paged in the order the database holds them.
-    """
-    look = (look or "").strip().lower()
-
-    def hit(r):
-        if not look:
-            return True
-        return look in " ".join(str(r.get(f) or "") for f in
-                                ("original", "replacement", "attribute_type")).lower()
-
-    matched = [r for r in rows if hit(r)]
-    tally = Counter(str(r.get("attribute_type") or "?") for r in matched)
-    sel = [r for r in matched
-           if not kind or str(r.get("attribute_type") or "?") == kind]
-    offset = max(0, min(offset, max(0, len(sel) - 1)))
-    return {"types": [{"type": k, "total": tally[k]} for k in sorted(tally)],
-            "rows": sel[offset:offset + limit], "total": len(sel),
-            "matched": len(matched), "offset": offset, "limit": limit,
-            "type": kind or ""}
-
 
 def session_id(left: str, right: str) -> str:
     """Stable id for a (left, right) pair, so verdicts survive a re-open."""
@@ -1446,7 +1463,12 @@ def session_id(left: str, right: str) -> str:
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Review</title><style>
-.doc{background:#fff;padding:10px 12px}
+/* .scroll is declared later with the same specificity and both classes land
+   on the same element, so the document needs the two-class selector or it
+   silently keeps .scroll's `padding:10px 0` and the text runs into the
+   divider on one side and the window frame on the other. */
+.scroll.doc{background:#fff;padding:18px 26px 32px}
+.doc{background:#fff}
 /* A wide sheet scrolls sideways rather than squeezing 40 columns into the
    pane. Both panes do it independently -- the sync mirrors vertical position,
    which is the axis a reviewer moves down. */
@@ -1629,43 +1651,12 @@ header{border-bottom:1px solid var(--line);padding:7px 12px;display:flex;gap:10p
 body.rz{cursor:col-resize;user-select:none}
 /* The mapping table, over the panes. A modal because verifying a substitution
    is a detour from reviewing documents, not a thing you do beside it. */
-#mveil{position:fixed;inset:0;background:rgba(26,29,33,.34);display:none;z-index:70;padding:34px}
-#mveil.on{display:grid;place-items:center}
-#mbox,#fbox{background:#fff;border-radius:10px;width:min(980px,96vw);max-height:86vh;
-  display:flex;flex-direction:column;box-shadow:0 12px 40px rgba(0,0,0,.22)}
-.mhead{display:flex;gap:10px;align-items:center;padding:12px 14px;border-bottom:1px solid var(--line)}
-.mhead input{flex:1;font:12.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
-  padding:5px 8px;border:1px solid var(--line);border-radius:6px}
-/* A database browser, because that is what this is: the run's substitution
-   table, every attribute type down the side and the real rows in the middle.
-   Grouping it into sampled sections showed the shape of the run and hid the
-   row you were actually looking for. */
-.mmain{flex:1;display:grid;grid-template-columns:206px 1fr;min-height:0}
-#mtypes{overflow:auto;border-right:1px solid var(--line);background:#fcfcfd;
-  padding:6px 0 14px}
-#mwrap{display:flex;flex-direction:column;min-width:0;min-height:0}
-.mtype{display:flex;gap:8px;align-items:baseline;padding:5px 12px;cursor:pointer;
-  font-size:12px;border-left:2px solid transparent}
-.mtype:hover{background:var(--soft)}
-.mtype[aria-current=true]{background:var(--soft);border-left-color:var(--fg);font-weight:600}
-.mtype .n{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
-  font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace}
-.mtype .c{color:var(--mut);font-variant-numeric:tabular-nums;font-size:11px}
-#mpage{flex:0 0 auto;border-top:1px solid var(--line);padding:7px 14px;
-  display:flex;gap:10px;align-items:center;font-size:12px;color:var(--mut)}
-#mpage button{margin:0}
-#mbody th{position:sticky;top:0;background:#fff;text-align:left;z-index:2;
-  padding:7px 6px;border-bottom:1px solid var(--line);font-size:10px;
   text-transform:uppercase;letter-spacing:.05em;color:var(--mut);font-weight:600}
-#mbody,#fbody{overflow:auto;padding:0 14px 14px}
-#mbody table,#fbody table{border-collapse:collapse;width:100%;font-size:12.5px;table-layout:fixed}
-#mbody td,#fbody td{padding:4px 6px;border-bottom:1px solid #f0f2f4;vertical-align:top;
+#fbody{overflow:auto;padding:0 14px 14px}
+#fbody table{border-collapse:collapse;width:100%;font-size:12.5px;table-layout:fixed}
+#fbody td{padding:4px 6px;border-bottom:1px solid #f0f2f4;vertical-align:top;
   word-break:normal;overflow-wrap:break-word;
   font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-#mbody td.o{color:var(--bad);width:36%}
-#mbody td.r{color:var(--ok);width:36%}
-#mbody td.t{color:var(--mut);font-size:11.5px}
-#mbody td.cmt{width:84px;text-align:right;white-space:nowrap}
 /* One section per attribute type, its heading sticky, so scrolling through
    twelve thousand emails never loses which type you are in. */
 .mgrp{margin:0 0 18px}
@@ -1734,7 +1725,7 @@ body.rz{cursor:col-resize;user-select:none}
 .fold[aria-current=true]{background:var(--sel);border-left-color:var(--ok)}
 .fold .ic{flex:0 0 auto;display:flex;color:var(--mut)}
 .fold .tx{min-width:0;flex:1}
-.fold .n{font:600 13.5px/1.35 var(--ui);letter-spacing:-.005em;overflow:hidden;
+.fold .n{font:13px/1.35 var(--ui);overflow:hidden;
   text-overflow:ellipsis;white-space:nowrap}
 .fold .m{font:11px/1.4 var(--ui);color:var(--mut);margin-top:1px;
   font-variant-numeric:tabular-nums}
@@ -1854,7 +1845,7 @@ kbd{font:11px ui-monospace,Menlo,monospace;background:var(--soft);border:1px sol
   <button id="rev"><span id="revic"></span><span id="revtx">Review</span></button>
   <input id="cbox" placeholder="add a comment…" spellcheck="false">
   <span class="count" id="count"></span>
-  <button class="icobtn" id="mapbtn" title="the run&#39;s PII mapping table  (m)">PII-mappings</button>
+  <button class="icobtn" id="mapbtn" title="open the run&#39;s PII mapping table in TablePlus  (m)">PII mappings</button>
   <button class="icobtn" id="infobtn" title="details  (i)">i</button>
   <span id="split" title="change what is compared"></span>
 </header>
@@ -1875,18 +1866,11 @@ kbd{font:11px ui-monospace,Menlo,monospace;background:var(--soft);border:1px sol
   </main>
   <aside id="info"></aside>
 </div>
-<div id="mveil"><div id="mbox">
-  <div class="mhead"><b>PII-mappings</b><span id="mcount" class="opt"></span>
-    <input id="mq" placeholder="search every mapping &#8212; original, replacement or type" spellcheck="false">
-    <span class="x" id="mx">&times;</span></div>
-  <div class="mmain"><div id="mtypes"></div><div id="mwrap"><div id="mbody"></div>
-    <div id="mpage"></div></div></div>
-</div></div>
 <footer>
   <span><kbd>enter</kbd> review + next · <kbd>r</kbd> review · <kbd>c</kbd> comment</span>
   <span><kbd>&uarr;</kbd><kbd>&darr;</kbd> file · <kbd>&larr;</kbd><kbd>&rarr;</kbd> folder · <kbd>[</kbd><kbd>]</kbd> page</span>
   <span><kbd>a</kbd> <span id="mode">unreviewed only</span></span>
-  <span id="mapfoot" class="clik"><kbd>m</kbd> PII-mappings</span>
+  <span id="mapfoot" class="clik"><kbd>m</kbd> mappings in TablePlus</span>
   <span><kbd>s</kbd> list · <kbd>i</kbd> details · <kbd>y</kbd> <span id="hil" title="highlight PII  (h)">pii on</span>
   <span id="syn">sync on</span> · <kbd>?</kbd> keys</span>
   <input id="jump" placeholder="jump # or name">
@@ -2804,117 +2788,26 @@ function jump(s){
 }
 el("jump").addEventListener("keydown",e=>{if(e.key==="Enter"){jump(e.target.value);e.target.blur();}});
 
-let MAPQ=null;
-function maps(){
-  el("mveil").classList.add("on");
-  // No database is the common case -- it is written beside the pipeline and
-  // often never uploaded -- so the panel asks for one rather than refusing to
-  // open. An alert saying "use --mappings" is useless to somebody who started
-  // the tool from a preset and cannot restart it.
-  if(!HASMAP){ el("mcount").textContent=""; askMap(); return; }
-  el("mq").focus(); loadMaps();
+/* The mapping table is sqlite. TablePlus opens it; this just hands it over.
+   The panel that used to live here reimplemented sort, filter and paging over
+   a 400k-row file that every sqlite client already handles better, and the
+   one thing a reviewer actually wants to do with that table -- join it, sort
+   by type, export a slice -- it could not do at all. */
+async function maps(){
+  const btn=el("mapbtn"), was=btn.textContent;
+  btn.textContent="opening\u2026";
+  let r={};
+  try{ r=await(await fetch("/api/opendb?sid="+(VIEW[i]?VIEW[i].id:""))).json(); }
+  catch(e){ r={why:String(e)}; }
+  btn.textContent=was;
+  if(r.ok) return;
+  el("btext").textContent=(r.why||"could not open the mapping table")+
+    (r.install?"   Install it with:  "+r.install:"");
+  el("bfix").style.display="none";
+  el("banner").classList.add("on");
 }
-function askMap(err){
-  el("mbody").innerHTML=
-    `<p class="more">This run did not ship a mapping database. The pipeline `+
-    `writes <code>pii_mappings.db</code> beside the run and it is often not `+
-    `uploaded with the output \u2014 point at one and it opens here.</p>`+
-    `<div class="askmap"><input id="mspec" spellcheck="false" `+
-    `placeholder="~/runs/_pii/pii_mappings.db   or   s3://bucket/prefix/pii_mappings.db">`+
-    `<button class="mini" id="mgo">Open</button></div>`+
-    (err?`<p class="more bad">${esc(err)}</p>`:"");
-  const go=async()=>{
-    const spec=el("mspec").value.trim(); if(!spec)return;
-    el("mbody").innerHTML=`<p class="more">reading \u2026</p>`;
-    const r=await(await fetch("/api/usemap",{method:"POST",
-      body:JSON.stringify({spec})})).json();
-    if(r.error){askMap(r.error);return;}
-    HASMAP=true; el("mapbtn").classList.remove("off");
-    el("mq").focus(); loadMaps();
-  };
-  el("mgo").onclick=go;
-  el("mspec").addEventListener("keydown",e=>{if(e.key==="Enter")go();});
-  el("mspec").focus();
-}
-let MTYPE="", MOFF=0, MTOTAL=0, MLIM=200;
-async function loadMaps(){
-  const q=el("mq").value.trim();
-  const seq=++MSEQ;
-  const r=await(await fetch("/api/mappings?q="+encodeURIComponent(q)+
-    "&type="+encodeURIComponent(MTYPE)+"&offset="+MOFF)).json();
-  if(seq!==MSEQ)return;
-  if(r.error){el("mbody").innerHTML=`<p class="more">${esc(r.error)}</p>`;
-    el("mtypes").innerHTML=""; el("mpage").innerHTML="";
-    el("mcount").textContent=""; return;}
-  MTOTAL=r.total; MLIM=r.limit;
-  el("mcount").textContent = q
-    ? `${num(r.matched)} of ${num(r.count)} match`
-    : `${num(r.count)} mappings`;
-
-  // Every attribute type, always, with its real count. This is the index into
-  // a hundred thousand rows and the only way to see what the run did to each
-  // kind of thing it found.
-  const all=r.types.reduce((a,t)=>a+t.total,0);
-  el("mtypes").innerHTML =
-    `<div class="mtype" data-t="" aria-current="${MTYPE===""}">`+
-      `<span class=n>All types</span><span class=c>${num(all)}</span></div>`+
-    r.types.map(t=>`<div class="mtype" data-t="${esc(t.type)}" `+
-      `aria-current="${MTYPE===t.type}"><span class=n>${esc(t.type)}</span>`+
-      `<span class=c>${num(t.total)}</span></div>`).join("");
-
-  if(!r.rows.length){
-    el("mbody").innerHTML=`<p class="more">Nothing here.</p>`;
-    el("mpage").innerHTML=""; return;}
-  el("mbody").innerHTML=`<table><thead><tr><th>original</th><th>replacement</th>`+
-    `<th>type</th><th></th></tr></thead><tbody>`+
-    r.rows.map(m=>{
-      const notes=(m.notes||[]).map(n=>`<span class=mnote>${esc(n)}</span>`).join("");
-      return `<tr data-key="${esc(m.key)}">`+
-        `<td class=o>${esc(m.original==null?"":String(m.original))}</td>`+
-        `<td class=r>${m.replacement==null?"<i>not replaced</i>":esc(String(m.replacement))}`+
-          (notes?`<div class=mnotes>${notes}</div>`:"")+`</td>`+
-        `<td class=t>${esc(m.attribute_type==null?"":String(m.attribute_type))}</td>`+
-        `<td class=cmt><button class="lnk addn" title="comment on this mapping">`+
-          ((m.notes||[]).length?`&#9679; ${(m.notes||[]).length}`:"comment")+`</button></td></tr>`;
-    }).join("")+`</tbody></table>`;
-  el("mbody").scrollTop=0;
-
-  const from=r.offset+1, to=Math.min(r.offset+r.rows.length, r.total);
-  el("mpage").innerHTML=
-    `<span>${num(from)}\u2013${num(to)} of ${num(r.total)}`+
-    (MTYPE?` in ${esc(MTYPE)}`:"")+`</span>`+
-    `<button class="lnk mprev"${r.offset?"":" disabled"}>&larr; previous</button>`+
-    `<button class="lnk mnext"${to<r.total?"":" disabled"}>next &rarr;</button>`;
-}
-el("mtypes").addEventListener("click",e=>{
-  const t=e.target.closest(".mtype"); if(!t)return;
-  MTYPE=t.dataset.t; MOFF=0; loadMaps();
-});
-el("mpage").addEventListener("click",e=>{
-  if(e.target.closest(".mprev")){MOFF=Math.max(0,MOFF-MLIM);loadMaps();}
-  else if(e.target.closest(".mnext")){MOFF=MOFF+MLIM;loadMaps();}
-});
-el("mbody").addEventListener("click",async e=>{
-  const add=e.target.closest(".addn");
-  if(!add)return;
-  const key=add.closest("tr").dataset.key;
-  const text=prompt("Comment on this mapping");
-  if(text===null)return;
-  await fetch("/api/mapnote",{method:"POST",
-    body:JSON.stringify({key,text})});
-  loadMaps();
-});
-el("mq").addEventListener("input",()=>{clearTimeout(MAPQ);
-  MOFF=0;   // a filtered list is a different list; carrying an offset over it
-  MAPQ=setTimeout(loadMaps,180);});
-el("mx").onclick=()=>el("mveil").classList.remove("on");
-el("mveil").onclick=e=>{if(e.target.id==="mveil")el("mveil").classList.remove("on");};
 
 addEventListener("keydown",e=>{
-  if(el("mveil").classList.contains("on")){
-    if(e.key==="Escape") el("mveil").classList.remove("on");
-    return;
-  }
   if(el("app").style.display==="none")return;
   // Cmd/Ctrl+Shift+F jumps to the search box from anywhere, including from
   // inside another field -- so it is checked BEFORE the input bail-out and
@@ -3517,35 +3410,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "user": user,
                 "db": spec,
             })
-        if path == "/api/mappings":
+        if path == "/api/opendb":
+            # The mapping table is sqlite. Hand it to a sqlite client instead
+            # of redrawing sort/filter/paging over it, badly, in a modal.
+            spec = S.get("map_spec")
+            user = ""
             q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            try:
-                src = S.get("map_spec")
-                if not src:
-                    return self._json({"error": "no mapping database for this run"})
-                out = read_mappings(src, S.get("profile"),
-                                    S.get("map_store"), S.get("map_inner"))
-            except Exception as exc:  # noqa: BLE001 -- shown in the panel
-                return self._json({"error": f"{type(exc).__name__}: {exc}"[:200]})
-
-            def one(name, cast, default):
-                raw = (q.get(name) or [""])[0].strip()
+            sid = (q.get("sid") or [""])[0].strip()
+            if sid:
                 try:
-                    return cast(raw) if raw else default
-                except ValueError:
-                    return default
-
-            page = browse_mappings(out["rows"],
-                                   kind=(q.get("type") or [""])[0].strip() or None,
-                                   look=(q.get("q") or [""])[0],
-                                   offset=one("offset", int, 0),
-                                   limit=min(one("limit", int, PAGE_ROWS), 1000))
-            notes = _read_json(NOTES, {}).get(out["path"], {})
-            for r in page["rows"]:
-                r["key"] = map_key(r)
-                r["notes"] = notes.get(r["key"], [])
-            page.update(path=out["path"], count=out["count"])
-            return self._json(page)
+                    user = (S["rows"][int(sid)].get("label") or "").split("/")[0]
+                except Exception:  # noqa: BLE001
+                    user = ""
+            got = resolve_map(spec, S.get("profile"), user) if spec else None
+            return self._json(open_mappings(got or spec, S.get("profile")))
         if path.startswith("/api/metrics/"):
             try:
                 return self._json(metrics(path.rsplit("/", 1)[1]))
@@ -3718,26 +3596,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if S.get("session"):
                     S["session"]["has_map"] = True
             return self._json({"ok": True, "count": out["count"]})
-        if path == "/api/mapnote":
-            key, text = body.get("key"), (body.get("text") or "").strip()
-            src = S.get("map_spec")
-            if not (src and key):
-                return self._json({"error": "no mapping"}, 400)
-            with _LOCK:
-                all_notes = _read_json(NOTES, {})
-                per = all_notes.setdefault(src, {})
-                got = per.setdefault(key, [])
-                if text:
-                    got.append(text)
-                elif got:
-                    # An empty body removes the last one, which is the whole
-                    # of "undo" here. No editing, no history -- a comment on a
-                    # substitution is a note to a colleague, not a record.
-                    got.pop()
-                if not got:
-                    per.pop(key, None)
-                _write_json(NOTES, all_notes)
-            return self._json({"notes": got})
         if path == "/api/mark":
             if not S.get("ready"):
                 return self._json({"error": "no session"}, 409)
