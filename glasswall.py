@@ -1475,7 +1475,7 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
    Both panes must stay the SAME height row for row or the synced scroll
    drifts, which is why a disclosure opened on one side opens on the other. */
 .doc .eml dl.hdr{display:grid;grid-template-columns:max-content 1fr;
-  gap:0 12px;margin:0 0 4px 0;font-size:12.5px;line-height:1.35}
+  gap:3px 16px;margin:0 0 6px 0;font:13.5px/1.5 var(--ui)}
 .doc .eml dl.hdr dt{color:#888;font-weight:400;white-space:nowrap}
 .doc .eml dl.hdr dd{margin:0;word-break:break-word}
 .doc .eml details.more{margin:0 0 8px 0}
@@ -1489,17 +1489,16 @@ PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 .doc .eml pre.body{border-top:1px solid var(--line,#e3e6ea);
   margin:10px 0 0 0;padding:12px 0 0 0;font-size:13px;line-height:1.45;
   color:#1a1a1a}
-.doc .eml dl.hdr{font-size:12px}
+.doc .eml details.more dl.hdr{font:12px/1.5 var(--doc)}
 /* Wordmark. Quiet on purpose -- this sits above a document all day. */
-.wm{font-weight:600;letter-spacing:-.01em;color:#7a8290}
-.wm.hdr{font-size:12px;padding:0 10px 0 2px;border-right:1px solid var(--line,#e3e6ea);
-  margin-right:8px;white-space:nowrap}
+.wm{font:700 15px/1 var(--ui);letter-spacing:-.02em;color:var(--fg)}
+.wm.hdr{padding:0 12px 0 4px;margin-right:4px;white-space:nowrap}
 h1 .wm{color:#9aa0a6;font-weight:600;margin-right:6px}
 .skelname{position:absolute;left:50%;top:42%;transform:translate(-50%,-50%);
   color:#c3c8cf;font-size:12px;letter-spacing:.06em;text-transform:lowercase;
   pointer-events:none}
 
-.doc .eml dl.hdr dt{font-size:11.5px;letter-spacing:.02em}
+
 .doc .eml .atts{border-top:1px solid var(--line,#e3e6ea);margin-top:14px;
   padding-top:8px;font-size:12.5px}
 .doc .eml .abody img{display:block}
@@ -1538,7 +1537,14 @@ h1 .wm{color:#9aa0a6;font-weight:600;margin-right:6px}
 .opt{color:var(--mut);font-weight:400;font-size:11px}
 .loc{font-weight:600;font-size:13px;padding:2px 8px;border-radius:5px;background:#eef1f5;
      color:#333;white-space:nowrap;max-width:22ch;overflow:hidden;text-overflow:ellipsis}
-:root{--fg:#1a1d21;--mut:#6b7076;--line:#e4e7ea;--soft:#f7f8f9;--ok:#0b6b5e;--warn:#a15c00;--bad:#b3261e;--sel:#eef4f3}
+:root{--fg:#1a1d21;--mut:#6b7076;--line:#e4e7ea;--soft:#f7f8f9;--ok:#0b6b5e;--warn:#a15c00;--bad:#b3261e;--sel:#eef4f3;
+ --ui:ui-sans-serif,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
+ --doc:ui-monospace,SFMono-Regular,Menlo,monospace}
+/* Two typefaces, one rule: sans is the INTERFACE, mono is the DOCUMENT.
+   Chrome was set in 11px mono throughout -- folder names, header labels, mail
+   fields -- so the whole tool read as a terminal rather than as something you
+   look at for six hours. Mono stays only where a character has to line up
+   with the character opposite it: document bodies, filenames, the two panes. */
 html{color-scheme:light}*{box-sizing:border-box}
 body{margin:0;height:100vh;display:flex;flex-direction:column;background:#fff;color:var(--fg);
  font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",Inter,Roboto,sans-serif}
@@ -1727,18 +1733,13 @@ body.rz{cursor:col-resize;user-select:none}
 .fold:hover{background:var(--soft)}
 .fold[aria-current=true]{background:var(--sel);border-left-color:var(--ok)}
 .fold .ic{flex:0 0 auto;display:flex;color:var(--mut)}
-/* Name left, progress right, one line. The count is the thing being scanned
-   down the column, so it is tabular and right-aligned -- ragged digits make
-   a column of them unreadable. */
-.fold .tx{min-width:0;flex:1;display:flex;align-items:baseline;gap:8px}
-.fold .n{font:11.5px ui-monospace,Menlo,monospace;overflow:hidden;
-  text-overflow:ellipsis;white-space:nowrap;flex:1}
-.fold .cnt{flex:0 0 auto;font-size:10.5px;color:var(--mut);
-  font-variant-numeric:tabular-nums;white-space:nowrap}
-.fold .cnt b{font-weight:600;color:var(--fg)}
-.fold .cnt .w{color:var(--warn)}
-.fold .cnt .nt{color:var(--mut)}
-.file{padding:4px 9px 4px 26px;font:11px ui-monospace,Menlo,monospace;cursor:pointer;display:flex;gap:6px;align-items:center;color:var(--mut)}
+.fold .tx{min-width:0;flex:1}
+.fold .n{font:600 13.5px/1.35 var(--ui);letter-spacing:-.005em;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap}
+.fold .m{font:11px/1.4 var(--ui);color:var(--mut);margin-top:1px;
+  font-variant-numeric:tabular-nums}
+.fold .m .w{color:var(--warn)}
+.file{padding:5px 9px 5px 26px;font:12px/1.4 var(--doc);cursor:pointer;display:flex;gap:6px;align-items:center;color:var(--mut)}
 .file:hover{background:var(--soft);color:var(--fg)}
 .file[aria-current=true]{background:var(--sel);color:var(--fg);font-weight:600}
 .file .ic{flex:0 0 auto;display:flex;opacity:.55}
@@ -2114,20 +2115,18 @@ function folderRow(name,arr,go){
   const sub=new Set();
   arr.forEach(p=>{const r=p.label.slice(name.length+1); const ix=r.indexOf("/");
     if(ix>0) sub.add(r.slice(0,ix));});
-  // Progress, on one line, right-aligned. The old row spent two lines and
-  // five facts -- file count, reviewed, bytes, percent, subfolders -- on
-  // every folder, so the one number a reviewer actually scans for ("how much
-  // of this is left") had to be read out of a sentence, and the tree was half
-  // as tall as it could be. Only what is exceptional keeps words: missing
-  // counterparts, and comments that are waiting on someone.
-  const bits=[];
+  const bits=[`${arr.length} file${arr.length===1?"":"s"}`];
+  if(done) bits.push(done===arr.length?"all reviewed":`${done} reviewed`);
+  else if(arr.length) bits.push(`${arr.length} to go`);
+  if(bytes) bits.push(kb(bytes)+(TOTB?` · ${Math.round(bytes*100/TOTB)}%`:""));
+  if(sub.size) bits.push(`${sub.size} folder${sub.size===1?"":"s"}`);
+  if(note) bits.push(`${note} comment${note===1?"":"s"}`);
   if(miss) bits.push(`<span class="w">${miss} missing</span>`);
-  if(note) bits.push(`<span class="nt">${note}&#9679;</span>`);
   const d=document.createElement("div"); d.className="fold";
   d.innerHTML=`<span class="tw">&#9656;</span>
     <span class="ic">${done>=arr.length&&arr.length?ICON.done:ICON.folder}</span>
-    <span class="tx"><span class="n">${esc(name.split("/").pop())}</span>
-    <span class="cnt">${bits.join(" ")} <b>${done}</b>/${arr.length}</span></span>`;
+    <span class="tx"><div class="n">${esc(name.split("/").pop())}</div>
+    <div class="m">${bits.join(" · ")}</div></span>`;
   d.onclick=go;
   return d;
 }
